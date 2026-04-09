@@ -56,6 +56,7 @@
 
 #define NR_MAX_IO_QUEUE 72
 #define NR_MAX_PARALLEL_IO 16384
+#define NR_MAX_DISPATCHERS 8
 
 #define NVMEV_INTX_IRQ 15
 
@@ -153,7 +154,8 @@ struct nvmev_config {
 	unsigned long storage_start; //byte
 	unsigned long storage_size; // byte
 
-	unsigned int cpu_nr_dispatcher;
+	unsigned int nr_dispatchers;
+	unsigned int cpu_nr_dispatchers[NR_MAX_DISPATCHERS];
 	unsigned int nr_io_workers;
 	unsigned int cpu_nr_io_workers[32];
 
@@ -209,7 +211,20 @@ struct nvmev_io_worker {
 	unsigned long long latest_nsecs;
 
 	unsigned int id;
+	unsigned int dispatcher_id;
+	unsigned int cpu_nr_dispatcher;
 	struct task_struct *task_struct;
+	char thread_name[32];
+};
+
+struct nvmev_dispatcher_ctx {
+	unsigned int id;
+	unsigned int cpu_nr;
+	struct task_struct *task_struct;
+
+	unsigned int first_worker_id;
+	unsigned int nr_workers;
+	unsigned int io_worker_turn;
 	char thread_name[32];
 };
 
@@ -225,12 +240,13 @@ struct nvmev_dev {
 	struct pci_dev *pdev;
 
 	struct nvmev_config config;
-	struct task_struct *nvmev_dispatcher;
+
+	struct nvmev_dispatcher_ctx *dispatchers;
+	unsigned int nr_dispatchers;
 
 	void *storage_mapped;
 
 	struct nvmev_io_worker *io_workers;
-	unsigned int io_worker_turn;
 
 	void __iomem *msix_table;
 
@@ -315,7 +331,17 @@ void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 				struct buffer *write_buffer, size_t buffs_to_release);
 void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev);
 void NVMEV_IO_WORKER_FINAL(struct nvmev_dev *nvmev_vdev);
-int nvmev_proc_io_sq(int qid, int new_db, int old_db);
+int nvmev_proc_io_sq(struct nvmev_dispatcher_ctx *disp_ctx, int qid, int new_db, int old_db);
 void nvmev_proc_io_cq(int qid, int new_db, int old_db);
+
+static inline unsigned int nvmev_dispatcher_id_for_sq(unsigned int nr_dispatchers, int sqid)
+{
+	return (sqid - 1) % nr_dispatchers;
+}
+
+static inline unsigned int nvmev_dispatcher_id_for_cq(unsigned int nr_dispatchers, int cqid)
+{
+	return (cqid - 1) % nr_dispatchers;
+}
 
 #endif /* _LIB_NVMEV_H */

@@ -5,9 +5,13 @@
 
 #include "simple_ftl.h"
 
+/*
+ * Always called from a dispatcher kthread bound to its CPU,
+ * so local_clock() gives the correct per-dispatcher wallclock.
+ */
 static inline unsigned long long __get_wallclock(void)
 {
-	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
+	return local_clock();
 }
 
 static size_t __cmd_io_size(struct nvme_rw_command *cmd)
@@ -19,7 +23,28 @@ static size_t __cmd_io_size(struct nvme_rw_command *cmd)
 	return (cmd->length + 1) << LBA_BITS;
 }
 
-/* Return the time to complete */
+/*
+ * Atomically advance io_unit_stat[unit]: read old value, compute new completion
+ * time, and CAS in the busy-until time (completion + trailing).
+ * Returns the completion time (without trailing) so the caller can chain
+ * it into the next io_unit as a lower bound.
+ */
+static inline unsigned long long __advance_io_unit_stat(unsigned int io_unit,
+							unsigned long long nsecs_lower,
+							unsigned int addend,
+							unsigned int trailing)
+{
+	unsigned long long old_val, completion, busy_until;
+
+	do {
+		old_val = READ_ONCE(nvmev_vdev->io_unit_stat[io_unit]);
+		completion = max(nsecs_lower, old_val) + addend;
+		busy_until = completion + trailing;
+	} while (cmpxchg64(&nvmev_vdev->io_unit_stat[io_unit], old_val, busy_until) != old_val);
+
+	return completion;
+}
+
 static unsigned long long __schedule_io_units(int opcode, unsigned long lba, unsigned int length,
 					      unsigned long long nsecs_start)
 {
@@ -28,10 +53,11 @@ static unsigned long long __schedule_io_units(int opcode, unsigned long lba, uns
 		(lba >> (nvmev_vdev->config.io_unit_shift - LBA_BITS)) % nvmev_vdev->config.nr_io_units;
 	int nr_io_units = min(nvmev_vdev->config.nr_io_units, DIV_ROUND_UP(length, io_unit_size));
 
-	unsigned long long latest; /* Time of completion */
+	unsigned long long latest;
 	unsigned int delay = 0;
 	unsigned int latency = 0;
 	unsigned int trailing = 0;
+	bool first = true;
 
 	if (opcode == nvme_cmd_write) {
 		delay = nvmev_vdev->config.write_delay;
@@ -43,15 +69,14 @@ static unsigned long long __schedule_io_units(int opcode, unsigned long lba, uns
 		trailing = nvmev_vdev->config.read_trailing;
 	}
 
-	latest = max(nsecs_start, nvmev_vdev->io_unit_stat[io_unit]) + delay;
+	latest = nsecs_start;
 
 	do {
-		latest += latency;
-		nvmev_vdev->io_unit_stat[io_unit] = latest;
+		unsigned int addend = first ? (delay + latency) : latency;
+		unsigned int trail = (nr_io_units-- > 0) ? trailing : 0;
 
-		if (nr_io_units-- > 0) {
-			nvmev_vdev->io_unit_stat[io_unit] += trailing;
-		}
+		latest = __advance_io_unit_stat(io_unit, latest, addend, trail);
+		first = false;
 
 		length -= min(length, io_unit_size);
 		if (++io_unit >= nvmev_vdev->config.nr_io_units)
@@ -67,7 +92,7 @@ static unsigned long long __schedule_flush(struct nvmev_request *req)
 	int i;
 
 	for (i = 0; i < nvmev_vdev->config.nr_io_units; i++) {
-		latest = max(latest, nvmev_vdev->io_unit_stat[i]);
+		latest = max(latest, READ_ONCE(nvmev_vdev->io_unit_stat[i]));
 	}
 
 	return latest;

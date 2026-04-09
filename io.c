@@ -22,18 +22,20 @@ struct buffer;
 
 extern bool io_using_dma;
 
-static inline unsigned int __get_io_worker(int sqid)
+static inline unsigned int __get_io_worker(struct nvmev_dispatcher_ctx *disp, int sqid)
 {
 #ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
-	return (sqid - 1) % nvmev_vdev->config.nr_io_workers;
+	unsigned int nr_disp = nvmev_vdev->nr_dispatchers;
+	return disp->first_worker_id +
+	       ((sqid - 1) / nr_disp) % disp->nr_workers;
 #else
-	return nvmev_vdev->io_worker_turn;
+	return disp->first_worker_id + disp->io_worker_turn;
 #endif
 }
 
-static inline unsigned long long __get_wallclock(void)
+static inline unsigned long long __get_wallclock(unsigned int cpu_nr)
 {
-	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
+	return cpu_clock(cpu_nr);
 }
 
 static inline size_t __cmd_io_offset(struct nvme_rw_command *cmd)
@@ -291,9 +293,10 @@ static void __insert_req_sorted(unsigned int entry, struct nvmev_io_worker *work
 	}
 }
 
-static struct nvmev_io_worker *__allocate_work_queue_entry(int sqid, unsigned int *entry)
+static struct nvmev_io_worker *__allocate_work_queue_entry(
+		struct nvmev_dispatcher_ctx *disp, int sqid, unsigned int *entry)
 {
-	unsigned int io_worker_turn = __get_io_worker(sqid);
+	unsigned int io_worker_turn = __get_io_worker(disp, sqid);
 	struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[io_worker_turn];
 	unsigned int e = worker->free_seq;
 	struct nvmev_io_work *w = worker->work_queue + e;
@@ -303,9 +306,10 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(int sqid, unsigned in
 		return NULL;
 	}
 
-	if (++io_worker_turn == nvmev_vdev->config.nr_io_workers)
-		io_worker_turn = 0;
-	nvmev_vdev->io_worker_turn = io_worker_turn;
+#ifndef CONFIG_NVMEV_IO_WORKER_BY_SQ
+	if (++disp->io_worker_turn >= disp->nr_workers)
+		disp->io_worker_turn = 0;
+#endif
 
 	worker->free_seq = w->next;
 	BUG_ON(worker->free_seq >= NR_MAX_PARALLEL_IO);
@@ -314,7 +318,8 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(int sqid, unsigned in
 	return worker;
 }
 
-static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long long nsecs_start,
+static void __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, int sqid, int cqid,
+			     int sq_entry, unsigned long long nsecs_start,
 			     struct nvmev_result *ret)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
@@ -322,7 +327,7 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 	struct nvmev_io_work *w;
 	unsigned int entry;
 
-	worker = __allocate_work_queue_entry(sqid, &entry);
+	worker = __allocate_work_queue_entry(disp, sqid, &entry);
 	if (!worker)
 		return;
 
@@ -355,11 +360,13 @@ static void __enqueue_io_req(int sqid, int cqid, int sq_entry, unsigned long lon
 void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 				 struct buffer *write_buffer, size_t buffs_to_release)
 {
+	unsigned int disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, sqid);
+	struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[disp_id];
 	struct nvmev_io_worker *worker;
 	struct nvmev_io_work *w;
 	unsigned int entry;
 
-	worker = __allocate_work_queue_entry(sqid, &entry);
+	worker = __allocate_work_queue_entry(disp, sqid, &entry);
 	if (!worker)
 		return;
 
@@ -385,11 +392,13 @@ void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 	__insert_req_sorted(entry, worker, nsecs_target);
 }
 
-static void __reclaim_completed_reqs(void)
+static void __reclaim_completed_reqs(struct nvmev_dispatcher_ctx *disp)
 {
 	unsigned int turn;
+	unsigned int first_wid = disp->first_worker_id;
+	unsigned int last_wid = first_wid + disp->nr_workers;
 
-	for (turn = 0; turn < nvmev_vdev->config.nr_io_workers; turn++) {
+	for (turn = first_wid; turn < last_wid; turn++) {
 		struct nvmev_io_worker *worker;
 		struct nvmev_io_work *w;
 
@@ -436,13 +445,14 @@ static void __reclaim_completed_reqs(void)
 	}
 }
 
-static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
+static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int sq_entry,
+			      size_t *io_size)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
-	unsigned long long nsecs_start = __get_wallclock();
+	unsigned long long nsecs_start = __get_wallclock(disp->cpu_nr);
 	struct nvme_command *cmd = &sq_entry(sq_entry);
 #if (BASE_SSD == KV_PROTOTYPE)
-	uint32_t nsid = 0; // Some KVSSD programs give 0 as nsid for KV IO
+	uint32_t nsid = 0;
 #else
 	uint32_t nsid = cmd->common.nsid - 1;
 #endif
@@ -477,13 +487,13 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	prev_clock2 = local_clock();
 #endif
 
-	__enqueue_io_req(sqid, sq->cqid, sq_entry, nsecs_start, &ret);
+	__enqueue_io_req(disp, sqid, sq->cqid, sq_entry, nsecs_start, &ret);
 
 #ifdef PERF_DEBUG
 	prev_clock3 = local_clock();
 #endif
 
-	__reclaim_completed_reqs();
+	__reclaim_completed_reqs(disp);
 
 #ifdef PERF_DEBUG
 	prev_clock4 = local_clock();
@@ -505,7 +515,7 @@ static size_t __nvmev_proc_io(int sqid, int sq_entry, size_t *io_size)
 	return true;
 }
 
-int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
+int nvmev_proc_io_sq(struct nvmev_dispatcher_ctx *disp_ctx, int sqid, int new_db, int old_db)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	int num_proc = new_db - old_db;
@@ -520,7 +530,7 @@ int nvmev_proc_io_sq(int sqid, int new_db, int old_db)
 
 	for (seq = 0; seq < num_proc; seq++) {
 		size_t io_size;
-		if (!__nvmev_proc_io(sqid, sq_entry, &io_size))
+		if (!__nvmev_proc_io(disp_ctx, sqid, sq_entry, &io_size))
 			break;
 
 		if (++sq_entry == sq->queue_size) {
@@ -612,7 +622,7 @@ static int nvmev_io_worker(void *data)
 		   cpu_to_node(smp_processor_id()));
 
 	while (!kthread_should_stop()) {
-		unsigned long long curr_nsecs_wall = __get_wallclock();
+		unsigned long long curr_nsecs_wall = __get_wallclock(worker->cpu_nr_dispatcher);
 		unsigned long long curr_nsecs_local = local_clock();
 		long long delta = curr_nsecs_wall - curr_nsecs_local;
 
@@ -696,8 +706,15 @@ static int nvmev_io_worker(void *data)
 			struct nvmev_completion_queue *cq = nvmev_vdev->cqes[qidx];
 
 #ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
-			if ((worker->id) != __get_io_worker(qidx))
+			if (nvmev_dispatcher_id_for_cq(nvmev_vdev->nr_dispatchers, qidx)
+			    != worker->dispatcher_id)
 				continue;
+			{
+				struct nvmev_dispatcher_ctx *my_disp =
+					&nvmev_vdev->dispatchers[worker->dispatcher_id];
+				if (worker->id != __get_io_worker(my_disp, qidx))
+					continue;
+			}
 #endif
 			if (cq == NULL || !cq->irq_enabled)
 				continue;
@@ -737,13 +754,30 @@ static int nvmev_io_worker(void *data)
 
 void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 {
-	unsigned int i, worker_id;
+	unsigned int i, worker_id, disp_id;
+	unsigned int nr_disp = nvmev_vdev->nr_dispatchers;
+	unsigned int nr_workers = nvmev_vdev->config.nr_io_workers;
+	unsigned int workers_per_disp = nr_workers / nr_disp;
+	unsigned int extra_workers = nr_workers % nr_disp;
+	unsigned int worker_offset = 0;
 
 	nvmev_vdev->io_workers =
-		kcalloc(nvmev_vdev->config.nr_io_workers, sizeof(struct nvmev_io_worker), GFP_KERNEL);
-	nvmev_vdev->io_worker_turn = 0;
+		kcalloc(nr_workers, sizeof(struct nvmev_io_worker), GFP_KERNEL);
 
-	for (worker_id = 0; worker_id < nvmev_vdev->config.nr_io_workers; worker_id++) {
+	/* Assign workers to dispatchers before starting any kthreads */
+	for (disp_id = 0; disp_id < nr_disp; disp_id++) {
+		unsigned int count = workers_per_disp + (disp_id < extra_workers ? 1 : 0);
+		unsigned int cpu_nr = nvmev_vdev->dispatchers[disp_id].cpu_nr;
+
+		for (i = 0; i < count; i++) {
+			struct nvmev_io_worker *w = &nvmev_vdev->io_workers[worker_offset + i];
+			w->dispatcher_id = disp_id;
+			w->cpu_nr_dispatcher = cpu_nr;
+		}
+		worker_offset += count;
+	}
+
+	for (worker_id = 0; worker_id < nr_workers; worker_id++) {
 		struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[worker_id];
 
 		worker->work_queue =
@@ -759,11 +793,14 @@ void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 		worker->io_seq = -1;
 		worker->io_seq_end = -1;
 
-		snprintf(worker->thread_name, sizeof(worker->thread_name), "nvmev_io_worker_%d", worker_id);
+		snprintf(worker->thread_name, sizeof(worker->thread_name),
+			 "nvmev_io_worker_%d", worker_id);
 
-		worker->task_struct = kthread_create(nvmev_io_worker, worker, "%s", worker->thread_name);
+		worker->task_struct = kthread_create(nvmev_io_worker, worker,
+						     "%s", worker->thread_name);
 
-		kthread_bind(worker->task_struct, nvmev_vdev->config.cpu_nr_io_workers[worker_id]);
+		kthread_bind(worker->task_struct,
+			     nvmev_vdev->config.cpu_nr_io_workers[worker_id]);
 		wake_up_process(worker->task_struct);
 	}
 }

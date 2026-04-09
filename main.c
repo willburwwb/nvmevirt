@@ -70,6 +70,8 @@ static unsigned int write_trailing = 0;
 static unsigned int nr_io_units = 8;
 static unsigned int io_unit_shift = 12;
 
+static unsigned int nr_dispatchers = 1;
+
 static char *cpus;
 static unsigned int debug = 0;
 
@@ -107,48 +109,54 @@ module_param(nr_io_units, uint, 0444);
 MODULE_PARM_DESC(nr_io_units, "Number of I/O units that operate in parallel");
 module_param(io_unit_shift, uint, 0444);
 MODULE_PARM_DESC(io_unit_shift, "Size of each I/O unit (2^)");
+module_param(nr_dispatchers, uint, 0444);
+MODULE_PARM_DESC(nr_dispatchers, "Number of dispatcher threads (default 1)");
 module_param(cpus, charp, 0444);
-MODULE_PARM_DESC(cpus, "CPU list for process, completion(int.) threads, Seperated by Comma(,)");
+MODULE_PARM_DESC(cpus, "CPU list: first nr_dispatchers CPUs for dispatchers, rest for IO workers");
 module_param(debug, uint, 0644);
 
-// Returns true if an event is processed
-static bool nvmev_proc_dbs(void)
+static bool nvmev_proc_dbs(struct nvmev_dispatcher_ctx *disp_ctx)
 {
 	int qid;
 	int dbs_idx;
 	int new_db;
 	int old_db;
 	bool updated = false;
+	unsigned int nr_disp = nvmev_vdev->nr_dispatchers;
 
-	// Admin queue
-	new_db = nvmev_vdev->dbs[0];
-	if (new_db != nvmev_vdev->old_dbs[0]) {
-		nvmev_proc_admin_sq(new_db, nvmev_vdev->old_dbs[0]);
-		nvmev_vdev->old_dbs[0] = new_db;
-		updated = true;
-	}
-	new_db = nvmev_vdev->dbs[1];
-	if (new_db != nvmev_vdev->old_dbs[1]) {
-		nvmev_proc_admin_cq(new_db, nvmev_vdev->old_dbs[1]);
-		nvmev_vdev->old_dbs[1] = new_db;
-		updated = true;
+	if (disp_ctx->id == 0) {
+		new_db = nvmev_vdev->dbs[0];
+		if (new_db != nvmev_vdev->old_dbs[0]) {
+			nvmev_proc_admin_sq(new_db, nvmev_vdev->old_dbs[0]);
+			nvmev_vdev->old_dbs[0] = new_db;
+			updated = true;
+		}
+		new_db = nvmev_vdev->dbs[1];
+		if (new_db != nvmev_vdev->old_dbs[1]) {
+			nvmev_proc_admin_cq(new_db, nvmev_vdev->old_dbs[1]);
+			nvmev_vdev->old_dbs[1] = new_db;
+			updated = true;
+		}
 	}
 
-	// Submission queues
 	for (qid = 1; qid <= nvmev_vdev->nr_sq; qid++) {
+		if (nvmev_dispatcher_id_for_sq(nr_disp, qid) != disp_ctx->id)
+			continue;
 		if (nvmev_vdev->sqes[qid] == NULL)
 			continue;
 		dbs_idx = qid * 2;
 		new_db = nvmev_vdev->dbs[dbs_idx];
 		old_db = nvmev_vdev->old_dbs[dbs_idx];
 		if (new_db != old_db) {
-			nvmev_vdev->old_dbs[dbs_idx] = nvmev_proc_io_sq(qid, new_db, old_db);
+			nvmev_vdev->old_dbs[dbs_idx] =
+				nvmev_proc_io_sq(disp_ctx, qid, new_db, old_db);
 			updated = true;
 		}
 	}
 
-	// Completion queues
 	for (qid = 1; qid <= nvmev_vdev->nr_cq; qid++) {
+		if (nvmev_dispatcher_id_for_cq(nr_disp, qid) != disp_ctx->id)
+			continue;
 		if (nvmev_vdev->cqes[qid] == NULL)
 			continue;
 		dbs_idx = qid * 2 + 1;
@@ -166,16 +174,19 @@ static bool nvmev_proc_dbs(void)
 
 static int nvmev_dispatcher(void *data)
 {
-	static unsigned long last_dispatched_time = 0;
+	struct nvmev_dispatcher_ctx *disp_ctx = (struct nvmev_dispatcher_ctx *)data;
+	unsigned long last_dispatched_time = 0;
 
-	NVMEV_INFO("nvmev_dispatcher started on cpu %d (node %d)\n",
-		   nvmev_vdev->config.cpu_nr_dispatcher,
-		   cpu_to_node(nvmev_vdev->config.cpu_nr_dispatcher));
+	NVMEV_INFO("%s started on cpu %d (node %d), workers [%u..%u]\n",
+		   disp_ctx->thread_name, disp_ctx->cpu_nr,
+		   cpu_to_node(disp_ctx->cpu_nr),
+		   disp_ctx->first_worker_id,
+		   disp_ctx->first_worker_id + disp_ctx->nr_workers - 1);
 
 	while (!kthread_should_stop()) {
-		if (nvmev_proc_bars())
+		if (disp_ctx->id == 0 && nvmev_proc_bars())
 			last_dispatched_time = jiffies;
-		if (nvmev_proc_dbs())
+		if (nvmev_proc_dbs(disp_ctx))
 			last_dispatched_time = jiffies;
 
 		if (CONFIG_NVMEVIRT_IDLE_TIMEOUT != 0 &&
@@ -190,18 +201,54 @@ static int nvmev_dispatcher(void *data)
 
 static void NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
 {
-	nvmev_vdev->nvmev_dispatcher = kthread_create(nvmev_dispatcher, NULL, "nvmev_dispatcher");
-	if (nvmev_vdev->config.cpu_nr_dispatcher != -1)
-		kthread_bind(nvmev_vdev->nvmev_dispatcher, nvmev_vdev->config.cpu_nr_dispatcher);
-	wake_up_process(nvmev_vdev->nvmev_dispatcher);
+	unsigned int i;
+	unsigned int nr_disp = nvmev_vdev->config.nr_dispatchers;
+	unsigned int nr_workers = nvmev_vdev->config.nr_io_workers;
+	unsigned int workers_per_disp = nr_workers / nr_disp;
+	unsigned int extra_workers = nr_workers % nr_disp;
+	unsigned int worker_offset = 0;
+
+	nvmev_vdev->dispatchers = kcalloc(nr_disp, sizeof(struct nvmev_dispatcher_ctx), GFP_KERNEL);
+	nvmev_vdev->nr_dispatchers = nr_disp;
+
+	for (i = 0; i < nr_disp; i++) {
+		struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[i];
+
+		disp->id = i;
+		disp->cpu_nr = nvmev_vdev->config.cpu_nr_dispatchers[i];
+		disp->first_worker_id = worker_offset;
+		disp->nr_workers = workers_per_disp + (i < extra_workers ? 1 : 0);
+		disp->io_worker_turn = 0;
+
+		snprintf(disp->thread_name, sizeof(disp->thread_name),
+			 "nvmev_dispatcher_%u", i);
+
+		worker_offset += disp->nr_workers;
+
+		disp->task_struct = kthread_create(nvmev_dispatcher, disp,
+						   "%s", disp->thread_name);
+		kthread_bind(disp->task_struct, disp->cpu_nr);
+		wake_up_process(disp->task_struct);
+	}
 }
 
 static void NVMEV_DISPATCHER_FINAL(struct nvmev_dev *nvmev_vdev)
 {
-	if (!IS_ERR_OR_NULL(nvmev_vdev->nvmev_dispatcher)) {
-		kthread_stop(nvmev_vdev->nvmev_dispatcher);
-		nvmev_vdev->nvmev_dispatcher = NULL;
+	unsigned int i;
+
+	if (!nvmev_vdev->dispatchers)
+		return;
+
+	for (i = 0; i < nvmev_vdev->nr_dispatchers; i++) {
+		struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[i];
+		if (!IS_ERR_OR_NULL(disp->task_struct)) {
+			kthread_stop(disp->task_struct);
+			disp->task_struct = NULL;
+		}
 	}
+
+	kfree(nvmev_vdev->dispatchers);
+	nvmev_vdev->dispatchers = NULL;
 }
 
 #ifdef CONFIG_X86
@@ -470,21 +517,25 @@ static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)
 
 static bool __load_configs(struct nvmev_config *config)
 {
-	bool first = true;
 	unsigned int cpu_nr;
+	unsigned int cpu_idx = 0;
 	char *cpu;
 
 	if (__validate_configs() < 0) {
 		return false;
 	}
 
+	if (nr_dispatchers == 0 || nr_dispatchers > NR_MAX_DISPATCHERS) {
+		NVMEV_ERROR("nr_dispatchers must be between 1 and %d\n", NR_MAX_DISPATCHERS);
+		return false;
+	}
+
 #if (BASE_SSD == KV_PROTOTYPE)
-	memmap_size -= KV_MAPPING_TABLE_SIZE; // Reserve space for KV mapping table
+	memmap_size -= KV_MAPPING_TABLE_SIZE;
 #endif
 
 	config->memmap_start = memmap_start;
 	config->memmap_size = memmap_size;
-	// storage space starts from 1M offset
 	config->storage_start = memmap_start + MB(1);
 	config->storage_size = memmap_size - MB(1);
 
@@ -497,19 +548,29 @@ static bool __load_configs(struct nvmev_config *config)
 	config->nr_io_units = nr_io_units;
 	config->io_unit_shift = io_unit_shift;
 
+	config->nr_dispatchers = nr_dispatchers;
 	config->nr_io_workers = 0;
-	config->cpu_nr_dispatcher = -1;
+	memset(config->cpu_nr_dispatchers, 0xff, sizeof(config->cpu_nr_dispatchers));
 
 	while ((cpu = strsep(&cpus, ",")) != NULL) {
 		cpu_nr = (unsigned int)simple_strtol(cpu, NULL, 10);
-		if (first) {
-			config->cpu_nr_dispatcher = cpu_nr;
+		if (cpu_idx < nr_dispatchers) {
+			config->cpu_nr_dispatchers[cpu_idx] = cpu_nr;
 		} else {
 			config->cpu_nr_io_workers[config->nr_io_workers] = cpu_nr;
 			config->nr_io_workers++;
 		}
-		first = false;
+		cpu_idx++;
 	}
+
+	if (cpu_idx < nr_dispatchers) {
+		NVMEV_ERROR("Not enough CPUs specified: need at least %u for dispatchers\n",
+			    nr_dispatchers);
+		return false;
+	}
+
+	NVMEV_INFO("Configured %u dispatcher(s), %u IO worker(s)\n",
+		   config->nr_dispatchers, config->nr_io_workers);
 
 	return true;
 }
@@ -519,7 +580,7 @@ static void NVMEV_NAMESPACE_INIT(struct nvmev_dev *nvmev_vdev)
 	unsigned long long remaining_capacity = nvmev_vdev->config.storage_size;
 	void *ns_addr = nvmev_vdev->storage_mapped;
 	const int nr_ns = NR_NAMESPACES; // XXX: allow for dynamic nr_ns
-	const unsigned int disp_no = nvmev_vdev->config.cpu_nr_dispatcher;
+	const unsigned int disp_no = nvmev_vdev->config.cpu_nr_dispatchers[0];
 	int i;
 	unsigned long long size;
 
@@ -631,8 +692,8 @@ static int NVMeV_init(void)
 
 	__print_perf_configs();
 
-	NVMEV_IO_WORKER_INIT(nvmev_vdev);
 	NVMEV_DISPATCHER_INIT(nvmev_vdev);
+	NVMEV_IO_WORKER_INIT(nvmev_vdev);
 
 	pci_bus_add_devices(nvmev_vdev->virt_bus);
 
