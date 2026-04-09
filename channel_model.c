@@ -10,7 +10,7 @@
 
 static inline unsigned long long __get_wallclock(void)
 {
-	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
+	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatchers[0]);
 }
 
 void chmodel_init(struct channel_model *ch, uint64_t bandwidth /*MB/s*/)

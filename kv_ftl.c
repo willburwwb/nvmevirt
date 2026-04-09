@@ -21,7 +21,7 @@ static const struct allocator_ops bitmap_ops = {
 
 static inline unsigned long long __get_wallclock(void)
 {
-	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatcher);
+	return cpu_clock(nvmev_vdev->config.cpu_nr_dispatchers[0]);
 }
 
 static size_t __cmd_io_size(struct nvme_rw_command *cmd)

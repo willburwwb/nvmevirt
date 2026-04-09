@@ -391,7 +391,7 @@ static struct pci_bus *__create_pci_bus(void)
 	struct pci_bus *bus = NULL;
 	struct pci_dev *dev;
 
-	nvmev_pci_sysdata.node = cpu_to_node(nvmev_vdev->config.cpu_nr_dispatcher);
+	nvmev_pci_sysdata.node = cpu_to_node(nvmev_vdev->config.cpu_nr_dispatchers[0]);
 
 	bus = pci_scan_bus(NVMEV_PCI_BUS_NUM, &nvmev_pci_ops, &nvmev_pci_sysdata);
 
