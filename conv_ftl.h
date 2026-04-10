@@ -3,6 +3,7 @@
 #ifndef _NVMEVIRT_CONV_FTL_H
 #define _NVMEVIRT_CONV_FTL_H
 
+#include <linux/mutex.h>
 #include <linux/types.h>
 #include "pqueue/pqueue.h"
 #include "ssd_config.h"
@@ -65,6 +66,16 @@ struct conv_ftl {
 	struct write_pointer gc_wp;
 	struct line_mgmt lm;
 	struct write_flow_control wfc;
+};
+
+/*
+ * Namespace-scoped context for conventional FTL.
+ * A single coarse mutex protects all mutable FTL states first for correctness
+ * under multi-dispatcher concurrency.
+ */
+struct conv_namespace {
+	struct conv_ftl *parts;
+	struct mutex lock;
 };
 
 void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *mapped_addr,

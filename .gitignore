@@ -171,3 +171,8 @@ sphinx_*/
 
 # Local makefile
 Makefile.local
+
+
+*.out
+.gitignore
+*.state

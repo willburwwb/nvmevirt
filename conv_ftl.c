@@ -13,6 +13,11 @@ static inline bool last_pg_in_wordline(struct conv_ftl *conv_ftl, struct ppa *pp
 	return (ppa->g.pg % spp->pgs_per_oneshotpg) == (spp->pgs_per_oneshotpg - 1);
 }
 
+static inline struct conv_namespace *conv_ns(struct nvmev_ns *ns)
+{
+	return (struct conv_namespace *)ns->ftls;
+}
+
 static bool should_gc(struct conv_ftl *conv_ftl)
 {
 	return (conv_ftl->lm.free_line_cnt <= conv_ftl->cp.gc_thres_lines);
@@ -378,6 +383,7 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 {
 	struct ssdparams spp;
 	struct convparams cpp;
+	struct conv_namespace *cns;
 	struct conv_ftl *conv_ftls;
 	struct ssd *ssd;
 	uint32_t i;
@@ -386,7 +392,15 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	ssd_init_params(&spp, size, nr_parts);
 	conv_init_params(&cpp);
 
+	cns = kmalloc(sizeof(*cns), GFP_KERNEL);
 	conv_ftls = kmalloc(sizeof(struct conv_ftl) * nr_parts, GFP_KERNEL);
+	if (!cns || !conv_ftls) {
+		kfree(cns);
+		kfree(conv_ftls);
+		return;
+	}
+	mutex_init(&cns->lock);
+	cns->parts = conv_ftls;
 
 	for (i = 0; i < nr_parts; i++) {
 		ssd = kmalloc(sizeof(struct ssd), GFP_KERNEL);
@@ -407,7 +421,7 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 	ns->id = id;
 	ns->csi = NVME_CSI_NVM;
 	ns->nr_parts = nr_parts;
-	ns->ftls = (void *)conv_ftls;
+	ns->ftls = (void *)cns;
 	ns->size = (uint64_t)((size * 100) / cpp.pba_pcent);
 	ns->mapped = mapped_addr;
 	/*register io command handler*/
@@ -421,7 +435,8 @@ void conv_init_namespace(struct nvmev_ns *ns, uint32_t id, uint64_t size, void *
 
 void conv_remove_namespace(struct nvmev_ns *ns)
 {
-	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
+	struct conv_namespace *cns = conv_ns(ns);
+	struct conv_ftl *conv_ftls = cns->parts;
 	const uint32_t nr_parts = SSD_PARTITIONS;
 	uint32_t i;
 
@@ -442,6 +457,7 @@ void conv_remove_namespace(struct nvmev_ns *ns)
 	}
 
 	kfree(conv_ftls);
+	kfree(cns);
 	ns->ftls = NULL;
 }
 
@@ -832,7 +848,7 @@ static bool is_same_flash_page(struct conv_ftl *conv_ftl, struct ppa ppa1, struc
 
 static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
-	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
+	struct conv_ftl *conv_ftls = conv_ns(ns)->parts;
 	struct conv_ftl *conv_ftl = &conv_ftls[0];
 	/* spp are shared by all instances*/
 	struct ssdparams *spp = &conv_ftl->ssd->sp;
@@ -924,7 +940,7 @@ static bool conv_read(struct nvmev_ns *ns, struct nvmev_request *req, struct nvm
 
 static bool conv_write(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
-	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
+	struct conv_ftl *conv_ftls = conv_ns(ns)->parts;
 	struct conv_ftl *conv_ftl = &conv_ftls[0];
 
 	/* wbuf and spp are shared by all instances */
@@ -1028,7 +1044,7 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 {
 	uint64_t start, latest;
 	uint32_t i;
-	struct conv_ftl *conv_ftls = (struct conv_ftl *)ns->ftls;
+	struct conv_ftl *conv_ftls = conv_ns(ns)->parts;
 
 	start = local_clock();
 	latest = start;
@@ -1046,17 +1062,20 @@ static void conv_flush(struct nvmev_ns *ns, struct nvmev_request *req, struct nv
 bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struct nvmev_result *ret)
 {
 	struct nvme_command *cmd = req->cmd;
+	struct conv_namespace *cns = conv_ns(ns);
+	bool ok = true;
 
 	NVMEV_ASSERT(ns->csi == NVME_CSI_NVM);
+	NVMEV_ASSERT(cns);
+
+	mutex_lock(&cns->lock);
 
 	switch (cmd->common.opcode) {
 	case nvme_cmd_write:
-		if (!conv_write(ns, req, ret))
-			return false;
+		ok = conv_write(ns, req, ret);
 		break;
 	case nvme_cmd_read:
-		if (!conv_read(ns, req, ret))
-			return false;
+		ok = conv_read(ns, req, ret);
 		break;
 	case nvme_cmd_flush:
 		conv_flush(ns, req, ret);
@@ -1067,5 +1086,6 @@ bool conv_proc_nvme_io_cmd(struct nvmev_ns *ns, struct nvmev_request *req, struc
 		break;
 	}
 
-	return true;
+	mutex_unlock(&cns->lock);
+	return ok;
 }

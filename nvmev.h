@@ -54,7 +54,7 @@
 #endif
 
 
-#define NR_MAX_IO_QUEUE 72
+#define NR_MAX_IO_QUEUE 128
 #define NR_MAX_PARALLEL_IO 16384
 #define NR_MAX_DISPATCHERS 8
 
