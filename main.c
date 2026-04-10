@@ -715,8 +715,12 @@ static void NVMeV_exit(void)
 		pci_remove_root_bus(nvmev_vdev->virt_bus);
 	}
 
-	NVMEV_DISPATCHER_FINAL(nvmev_vdev);
+	/*
+	 * Workers may still reference nvmev_vdev->dispatchers for CQ-to-worker
+	 * routing. Stop workers first, then stop/free dispatchers.
+	 */
 	NVMEV_IO_WORKER_FINAL(nvmev_vdev);
+	NVMEV_DISPATCHER_FINAL(nvmev_vdev);
 
 	NVMEV_NAMESPACE_FINAL(nvmev_vdev);
 	NVMEV_STORAGE_FINAL(nvmev_vdev);

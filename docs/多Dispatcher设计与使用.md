@@ -101,7 +101,7 @@ make
 sudo rmmod nvmev
 sudo insmod ./nvmev.ko \
   memmap_start=64G \
-  memmap_size=32G \
+  memmap_size=10G \
   nr_dispatchers=2 \
   cpus=7,8,9,10,11,12
 ```
