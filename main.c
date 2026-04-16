@@ -483,23 +483,12 @@ static int __proc_file_read(struct seq_file *m, void *data)
 			}
 		}
 
-		seq_puts(m, "worker_io id fast_read_hits slow_path_calls single_prp_reads "
-			    "multi_prp_ios avg_prp_map_ns avg_prp_list_ns avg_io_copy_ns "
-			    "avg_queue_wait_ns avg_post_copy_wait_ns avg_total_device_ns "
-			    "latency_samples\n");
+		seq_puts(m, "worker_io id avg_queue_wait_ns avg_post_copy_wait_ns "
+			    "avg_total_device_ns latency_samples\n");
 		if (nvmev_vdev->io_workers != NULL) {
 			for (i = 0; i < nvmev_vdev->config.nr_io_workers; i++) {
 				struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[i];
 				struct nvmev_io_worker_profile *p = &worker->profile;
-				unsigned long long avg_prp_map =
-					p->prp_map_calls ? div64_u64(p->prp_map_ns,
-								      p->prp_map_calls) : 0;
-				unsigned long long avg_prp_list =
-					p->prp_list_calls ? div64_u64(p->prp_list_ns,
-								       p->prp_list_calls) : 0;
-				unsigned long long avg_io_copy =
-					p->io_copy_calls ? div64_u64(p->io_copy_ns,
-								      p->io_copy_calls) : 0;
 				unsigned long long avg_queue_wait =
 					p->latency_samples ? div64_u64(p->queue_wait_ns,
 									p->latency_samples) : 0;
@@ -511,11 +500,8 @@ static int __proc_file_read(struct seq_file *m, void *data)
 									p->latency_samples) : 0;
 
 				seq_printf(m,
-					   "worker_io %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
-					   i, p->fast_read_hits, p->slow_path_calls,
-					   p->single_prp_reads, p->multi_prp_ios,
-					   avg_prp_map, avg_prp_list, avg_io_copy,
-					   avg_queue_wait, avg_post_copy_wait,
+					   "worker_io %u %llu %llu %llu %llu\n",
+					   i, avg_queue_wait, avg_post_copy_wait,
 					   avg_total_device, p->latency_samples);
 			}
 		}

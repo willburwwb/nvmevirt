@@ -46,152 +46,28 @@ static inline size_t __cmd_io_size(struct nvme_rw_command *cmd)
 	return (cmd->length + 1) << LBA_BITS;
 }
 
-static inline void *__map_prp_page(u64 paddr, bool *is_memremap, bool *is_kmapped)
-{
-	struct page *page;
-	void *vaddr;
-
-	*is_memremap = false;
-	*is_kmapped = false;
-
-	if (pfn_valid(paddr >> PAGE_SHIFT)) {
-		page = pfn_to_page(PRP_PFN(paddr));
-		vaddr = page_address(page);
-		if (vaddr != NULL)
-			return vaddr;
-
-		*is_kmapped = true;
-		return kmap_atomic_pfn(PRP_PFN(paddr));
-	}
-
-	*is_memremap = true;
-	return memremap(paddr & PAGE_MASK, PAGE_SIZE, MEMREMAP_WT);
-}
-
-static inline void __unmap_prp_page(void *vaddr, bool is_memremap, bool is_kmapped)
-{
-	if (vaddr == NULL)
-		return;
-
-	if (is_memremap)
-		memunmap(vaddr);
-	else if (is_kmapped)
-		kunmap_atomic(vaddr);
-}
-
-static inline bool __is_single_prp_io(struct nvme_rw_command *cmd, size_t length)
-{
-	size_t page_offs = cmd->prp1 & PAGE_OFFSET_MASK;
-
-	return length <= PAGE_SIZE && page_offs + length <= PAGE_SIZE;
-}
-
-static inline void *__map_prp_page_profiled(struct nvmev_io_worker_profile *profile, u64 paddr,
-					    bool *is_memremap, bool *is_kmapped)
-{
-	if (profile != NULL)
-		profile->prp_map_calls++;
-
-	return __map_prp_page(paddr, is_memremap, is_kmapped);
-}
-
-static inline void __profile_prp_map_done(struct nvmev_io_worker_profile *profile,
-					  unsigned long long prof_start)
-{
-	if (profile != NULL)
-		profile->prp_map_ns += local_clock() - prof_start;
-}
-
-static inline void __copy_io_bytes(struct nvmev_io_worker_profile *profile, void *dst,
-				   const void *src, size_t length)
-{
-	unsigned long long prof_start = 0;
-
-	if (profile != NULL) {
-		prof_start = local_clock();
-		profile->io_copy_calls++;
-	}
-
-	memcpy(dst, src, length);
-
-	if (profile != NULL)
-		profile->io_copy_ns += local_clock() - prof_start;
-}
-
-static inline bool __try_fast_read_io(struct nvmev_io_worker_profile *profile,
-				      struct nvme_rw_command *cmd, u8 *ns_base,
-				      size_t offset, size_t length)
-{
-	struct page *page;
-	void *page_base;
-	void *host_vaddr;
-	size_t page_offs;
-
-	if (cmd->opcode != nvme_cmd_read || !__is_single_prp_io(cmd, length))
-		return false;
-
-	if (profile != NULL)
-		profile->single_prp_reads++;
-
-	if (!pfn_valid(PRP_PFN(cmd->prp1)))
-		return false;
-
-	page = pfn_to_page(PRP_PFN(cmd->prp1));
-	page_base = page_address(page);
-	if (page_base == NULL)
-		return false;
-
-	page_offs = cmd->prp1 & PAGE_OFFSET_MASK;
-	host_vaddr = page_base + page_offs;
-	__copy_io_bytes(profile, host_vaddr, ns_base + offset, length);
-
-	if (profile != NULL)
-		profile->fast_read_hits++;
-
-	return true;
-}
-
-static unsigned int __do_perform_io(struct nvmev_io_worker *worker, int sqid, int sq_entry)
+static unsigned int __do_perform_io(int sqid, int sq_entry)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	struct nvme_rw_command *cmd = &sq_entry(sq_entry).rw;
-	struct nvmev_io_worker_profile *profile = unlikely(debug) ? &worker->profile : NULL;
 	size_t offset;
 	size_t length, remaining;
 	int prp_offs = 0;
 	int prp2_offs = 0;
 	u64 paddr;
 	u64 *paddr_list = NULL;
-	void *paddr_page = NULL;
 	size_t nsid = cmd->nsid - 1; // 0-based
-	u8 *ns_base;
 	bool is_paddr_memremap = false;
-	bool is_paddr_kmapped = false;
-	bool is_single_prp;
 
 	offset = __cmd_io_offset(cmd);
 	length = __cmd_io_size(cmd);
 	remaining = length;
-	ns_base = nvmev_vdev->ns[nsid].mapped;
-	is_single_prp = __is_single_prp_io(cmd, length);
-
-	if (likely(__try_fast_read_io(profile, cmd, ns_base, offset, length)))
-		return length;
-
-	if (profile != NULL) {
-		profile->slow_path_calls++;
-		if (!is_single_prp)
-			profile->multi_prp_ios++;
-	}
 
 	while (remaining) {
 		size_t io_size;
-		void *page_base;
 		void *vaddr;
 		size_t mem_offs = 0;
 		bool is_vaddr_memremap = false;
-		bool is_vaddr_kmapped = false;
-		unsigned long long prof_start = 0;
 
 		prp_offs++;
 		if (prp_offs == 1) {
@@ -199,30 +75,18 @@ static unsigned int __do_perform_io(struct nvmev_io_worker *worker, int sqid, in
 		} else if (prp_offs == 2) {
 			paddr = cmd->prp2;
 			if (remaining > PAGE_SIZE) {
-				if (profile != NULL)
-					prof_start = local_clock();
-				paddr_page = __map_prp_page_profiled(profile, paddr,
-								     &is_paddr_memremap,
-								     &is_paddr_kmapped);
-				if (profile != NULL)
-					__profile_prp_map_done(profile, prof_start);
-				if (profile != NULL)
-					prof_start = local_clock();
-				paddr_list = paddr_page + (paddr & PAGE_OFFSET_MASK);
-				paddr = paddr_list[prp2_offs++];
-				if (profile != NULL) {
-					profile->prp_list_calls++;
-					profile->prp_list_ns += local_clock() - prof_start;
+				if (pfn_valid(paddr >> PAGE_SHIFT)) {
+					paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
+						(paddr & PAGE_OFFSET_MASK);
+				} else {
+					paddr_list = memremap(paddr, PAGE_SIZE, MEMREMAP_WT);
+					paddr_list += (paddr & PAGE_OFFSET_MASK);
+					is_paddr_memremap = true;
 				}
+				paddr = paddr_list[prp2_offs++];
 			}
 		} else {
-			if (profile != NULL)
-				prof_start = local_clock();
 			paddr = paddr_list[prp2_offs++];
-			if (profile != NULL) {
-				profile->prp_list_calls++;
-				profile->prp_list_ns += local_clock() - prof_start;
-			}
 		}
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
@@ -233,28 +97,39 @@ static unsigned int __do_perform_io(struct nvmev_io_worker *worker, int sqid, in
 				io_size = PAGE_SIZE - mem_offs;
 		}
 
-		if (profile != NULL)
-			prof_start = local_clock();
-		page_base = __map_prp_page_profiled(profile, paddr, &is_vaddr_memremap,
-						    &is_vaddr_kmapped);
-		if (profile != NULL)
-			__profile_prp_map_done(profile, prof_start);
-		vaddr = page_base + mem_offs;
+		if (pfn_valid(paddr >> PAGE_SHIFT)) {
+			vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
+		} else {
+			vaddr = memremap(paddr, PAGE_SIZE, MEMREMAP_WT);
+			is_vaddr_memremap = true;
+		}
 
 		if (cmd->opcode == nvme_cmd_write ||
 		    cmd->opcode == nvme_cmd_zone_append) {
-			__copy_io_bytes(profile, ns_base + offset, vaddr, io_size);
+			memcpy(nvmev_vdev->ns[nsid].mapped + offset, vaddr + mem_offs, io_size);
 		} else if (cmd->opcode == nvme_cmd_read) {
-			__copy_io_bytes(profile, vaddr, ns_base + offset, io_size);
+			memcpy(vaddr + mem_offs, nvmev_vdev->ns[nsid].mapped + offset, io_size);
 		}
 
-		__unmap_prp_page(page_base, is_vaddr_memremap, is_vaddr_kmapped);
+		if (vaddr != NULL && !is_vaddr_memremap) {
+			kunmap_atomic(vaddr);
+			vaddr = NULL;
+		} else if (vaddr != NULL && is_vaddr_memremap) {
+			memunmap(vaddr);
+			vaddr = NULL;
+			is_vaddr_memremap = false;
+		}
 
 		remaining -= io_size;
 		offset += io_size;
 	}
 
-	__unmap_prp_page(paddr_page, is_paddr_memremap, is_paddr_kmapped);
+	if (paddr_list) {
+		if (!is_paddr_memremap)
+			kunmap_atomic(paddr_list);
+		else
+			memunmap(paddr_list);
+	}
 	paddr_list = NULL;
 
 	return length;
@@ -274,11 +149,9 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 	int num_prps = 0;
 	u64 paddr;
 	u64 *tmp_paddr_list = NULL;
-	void *tmp_paddr_page = NULL;
 	size_t io_size;
 	size_t mem_offs = 0;
 	bool is_memremap = false;
-	bool is_kmapped = false;
 
 	offset = __cmd_io_offset(cmd);
 	length = __cmd_io_size(cmd);
@@ -295,11 +168,17 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 		} else if (prp_offs == 2) {
 			paddr_list[prp_offs] = cmd->prp2;
 			if (remaining > PAGE_SIZE) {
-				tmp_paddr_page = __map_prp_page(paddr_list[prp_offs],
-								&is_memremap,
-								&is_kmapped);
-				tmp_paddr_list =
-					tmp_paddr_page + (paddr_list[prp_offs] & PAGE_OFFSET_MASK);
+				if (pfn_valid(paddr_list[prp_offs] >> PAGE_SHIFT)) {
+					tmp_paddr_list =
+						kmap_atomic_pfn(PRP_PFN(paddr_list[prp_offs])) +
+						(paddr_list[prp_offs] & PAGE_OFFSET_MASK);
+				} else {
+					tmp_paddr_list = memremap(paddr_list[prp_offs], PAGE_SIZE,
+								 MEMREMAP_WT);
+					tmp_paddr_list +=
+						(paddr_list[prp_offs] & PAGE_OFFSET_MASK);
+					is_memremap = true;
+				}
 				paddr_list[prp_offs] = tmp_paddr_list[prp2_offs++];
 			}
 		} else {
@@ -318,7 +197,12 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 	}
 	num_prps = prp_offs;
 
-	__unmap_prp_page(tmp_paddr_page, is_memremap, is_kmapped);
+	if (tmp_paddr_list != NULL && !is_memremap) {
+		kunmap_atomic(tmp_paddr_list);
+	} else if (tmp_paddr_list != NULL && is_memremap) {
+		memunmap(tmp_paddr_list);
+		is_memremap = false;
+	}
 
 	remaining = length;
 	prp_offs = 1;
@@ -878,10 +762,10 @@ static int nvmev_io_worker(void *data)
 						w->result0 = ns->perform_io_cmd(
 							ns, &sq_entry(w->sq_entry), &(w->status));
 					} else {
-						__do_perform_io(worker, w->sqid, w->sq_entry);
+						__do_perform_io(w->sqid, w->sq_entry);
 					}
 #else 
-					__do_perform_io(worker, w->sqid, w->sq_entry);
+					__do_perform_io(w->sqid, w->sq_entry);
 #endif
 				}
 
