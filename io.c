@@ -86,10 +86,76 @@ static inline bool __is_single_prp_io(struct nvme_rw_command *cmd, size_t length
 	return length <= PAGE_SIZE && page_offs + length <= PAGE_SIZE;
 }
 
-static unsigned int __do_perform_io(int sqid, int sq_entry)
+static inline void *__map_prp_page_profiled(struct nvmev_io_worker_profile *profile, u64 paddr,
+					    bool *is_memremap, bool *is_kmapped)
+{
+	if (profile != NULL)
+		profile->prp_map_calls++;
+
+	return __map_prp_page(paddr, is_memremap, is_kmapped);
+}
+
+static inline void __profile_prp_map_done(struct nvmev_io_worker_profile *profile,
+					  unsigned long long prof_start)
+{
+	if (profile != NULL)
+		profile->prp_map_ns += local_clock() - prof_start;
+}
+
+static inline void __copy_io_bytes(struct nvmev_io_worker_profile *profile, void *dst,
+				   const void *src, size_t length)
+{
+	unsigned long long prof_start = 0;
+
+	if (profile != NULL) {
+		prof_start = local_clock();
+		profile->io_copy_calls++;
+	}
+
+	memcpy(dst, src, length);
+
+	if (profile != NULL)
+		profile->io_copy_ns += local_clock() - prof_start;
+}
+
+static inline bool __try_fast_read_io(struct nvmev_io_worker_profile *profile,
+				      struct nvme_rw_command *cmd, u8 *ns_base,
+				      size_t offset, size_t length)
+{
+	struct page *page;
+	void *page_base;
+	void *host_vaddr;
+	size_t page_offs;
+
+	if (cmd->opcode != nvme_cmd_read || !__is_single_prp_io(cmd, length))
+		return false;
+
+	if (profile != NULL)
+		profile->single_prp_reads++;
+
+	if (!pfn_valid(PRP_PFN(cmd->prp1)))
+		return false;
+
+	page = pfn_to_page(PRP_PFN(cmd->prp1));
+	page_base = page_address(page);
+	if (page_base == NULL)
+		return false;
+
+	page_offs = cmd->prp1 & PAGE_OFFSET_MASK;
+	host_vaddr = page_base + page_offs;
+	__copy_io_bytes(profile, host_vaddr, ns_base + offset, length);
+
+	if (profile != NULL)
+		profile->fast_read_hits++;
+
+	return true;
+}
+
+static unsigned int __do_perform_io(struct nvmev_io_worker *worker, int sqid, int sq_entry)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	struct nvme_rw_command *cmd = &sq_entry(sq_entry).rw;
+	struct nvmev_io_worker_profile *profile = unlikely(debug) ? &worker->profile : NULL;
 	size_t offset;
 	size_t length, remaining;
 	int prp_offs = 0;
@@ -98,32 +164,24 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 	u64 *paddr_list = NULL;
 	void *paddr_page = NULL;
 	size_t nsid = cmd->nsid - 1; // 0-based
+	u8 *ns_base;
 	bool is_paddr_memremap = false;
 	bool is_paddr_kmapped = false;
+	bool is_single_prp;
 
 	offset = __cmd_io_offset(cmd);
 	length = __cmd_io_size(cmd);
 	remaining = length;
+	ns_base = nvmev_vdev->ns[nsid].mapped;
+	is_single_prp = __is_single_prp_io(cmd, length);
 
-	if (likely(__is_single_prp_io(cmd, length))) {
-		void *page_base;
-		void *host_vaddr;
-		size_t page_offs = cmd->prp1 & PAGE_OFFSET_MASK;
-		bool is_memremap = false;
-		bool is_kmapped = false;
-
-		page_base = __map_prp_page(cmd->prp1, &is_memremap, &is_kmapped);
-		host_vaddr = page_base + page_offs;
-
-		if (cmd->opcode == nvme_cmd_write ||
-		    cmd->opcode == nvme_cmd_zone_append) {
-			memcpy(nvmev_vdev->ns[nsid].mapped + offset, host_vaddr, length);
-		} else if (cmd->opcode == nvme_cmd_read) {
-			memcpy(host_vaddr, nvmev_vdev->ns[nsid].mapped + offset, length);
-		}
-
-		__unmap_prp_page(page_base, is_memremap, is_kmapped);
+	if (likely(__try_fast_read_io(profile, cmd, ns_base, offset, length)))
 		return length;
+
+	if (profile != NULL) {
+		profile->slow_path_calls++;
+		if (!is_single_prp)
+			profile->multi_prp_ios++;
 	}
 
 	while (remaining) {
@@ -133,6 +191,7 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 		size_t mem_offs = 0;
 		bool is_vaddr_memremap = false;
 		bool is_vaddr_kmapped = false;
+		unsigned long long prof_start = 0;
 
 		prp_offs++;
 		if (prp_offs == 1) {
@@ -140,13 +199,30 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 		} else if (prp_offs == 2) {
 			paddr = cmd->prp2;
 			if (remaining > PAGE_SIZE) {
-				paddr_page = __map_prp_page(paddr, &is_paddr_memremap,
-							    &is_paddr_kmapped);
+				if (profile != NULL)
+					prof_start = local_clock();
+				paddr_page = __map_prp_page_profiled(profile, paddr,
+								     &is_paddr_memremap,
+								     &is_paddr_kmapped);
+				if (profile != NULL)
+					__profile_prp_map_done(profile, prof_start);
+				if (profile != NULL)
+					prof_start = local_clock();
 				paddr_list = paddr_page + (paddr & PAGE_OFFSET_MASK);
 				paddr = paddr_list[prp2_offs++];
+				if (profile != NULL) {
+					profile->prp_list_calls++;
+					profile->prp_list_ns += local_clock() - prof_start;
+				}
 			}
 		} else {
+			if (profile != NULL)
+				prof_start = local_clock();
 			paddr = paddr_list[prp2_offs++];
+			if (profile != NULL) {
+				profile->prp_list_calls++;
+				profile->prp_list_ns += local_clock() - prof_start;
+			}
 		}
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
@@ -157,14 +233,19 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 				io_size = PAGE_SIZE - mem_offs;
 		}
 
-		page_base = __map_prp_page(paddr, &is_vaddr_memremap, &is_vaddr_kmapped);
+		if (profile != NULL)
+			prof_start = local_clock();
+		page_base = __map_prp_page_profiled(profile, paddr, &is_vaddr_memremap,
+						    &is_vaddr_kmapped);
+		if (profile != NULL)
+			__profile_prp_map_done(profile, prof_start);
 		vaddr = page_base + mem_offs;
 
 		if (cmd->opcode == nvme_cmd_write ||
 		    cmd->opcode == nvme_cmd_zone_append) {
-			memcpy(nvmev_vdev->ns[nsid].mapped + offset, vaddr, io_size);
+			__copy_io_bytes(profile, ns_base + offset, vaddr, io_size);
 		} else if (cmd->opcode == nvme_cmd_read) {
-			memcpy(vaddr, nvmev_vdev->ns[nsid].mapped + offset, io_size);
+			__copy_io_bytes(profile, vaddr, ns_base + offset, io_size);
 		}
 
 		__unmap_prp_page(page_base, is_vaddr_memremap, is_vaddr_kmapped);
@@ -782,9 +863,8 @@ static int nvmev_io_worker(void *data)
 			if (w->is_copied == false) {
 				if (unlikely(debug))
 					prof_start = local_clock();
-#ifdef PERF_DEBUG
-				w->nsecs_copy_start = local_clock() + delta;
-#endif
+				if (unlikely(debug) && !w->is_internal)
+					w->nsecs_copy_start = local_clock() + delta;
 				if (w->is_internal) {
 					;
 				} else if (io_using_dma) {
@@ -798,16 +878,15 @@ static int nvmev_io_worker(void *data)
 						w->result0 = ns->perform_io_cmd(
 							ns, &sq_entry(w->sq_entry), &(w->status));
 					} else {
-						__do_perform_io(w->sqid, w->sq_entry);
+						__do_perform_io(worker, w->sqid, w->sq_entry);
 					}
 #else 
-					__do_perform_io(w->sqid, w->sq_entry);
+					__do_perform_io(worker, w->sqid, w->sq_entry);
 #endif
 				}
 
-#ifdef PERF_DEBUG
-				w->nsecs_copy_done = local_clock() + delta;
-#endif
+				if (unlikely(debug) && !w->is_internal)
+					w->nsecs_copy_done = local_clock() + delta;
 				if (unlikely(debug)) {
 					worker->profile.copy_calls++;
 					worker->profile.copy_ns += local_clock() - prof_start;
@@ -834,8 +913,17 @@ static int nvmev_io_worker(void *data)
 				NVMEV_DEBUG_VERBOSE("%s: completed %u, %d %d %d\n", worker->thread_name, curr,
 					    w->sqid, w->cqid, w->sq_entry);
 
+				if (unlikely(debug) && !w->is_internal) {
+					w->nsecs_cq_filled = local_clock() + delta;
+					worker->profile.latency_samples++;
+					worker->profile.queue_wait_ns +=
+						w->nsecs_copy_start - w->nsecs_enqueue;
+					worker->profile.post_copy_wait_ns +=
+						w->nsecs_cq_filled - w->nsecs_copy_done;
+					worker->profile.total_device_ns +=
+						w->nsecs_cq_filled - w->nsecs_start;
+				}
 #ifdef PERF_DEBUG
-				w->nsecs_cq_filled = local_clock() + delta;
 				trace_printk("%llu %llu %llu %llu %llu %llu\n", w->nsecs_start,
 					     w->nsecs_enqueue - w->nsecs_start,
 					     w->nsecs_copy_start - w->nsecs_start,
