@@ -25,9 +25,7 @@ extern bool io_using_dma;
 static inline unsigned int __get_io_worker(struct nvmev_dispatcher_ctx *disp, int sqid)
 {
 #ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
-	unsigned int nr_disp = nvmev_vdev->nr_dispatchers;
-	return disp->first_worker_id +
-	       ((sqid - 1) / nr_disp) % disp->nr_workers;
+	return nvmev_io_worker_id_for_queue(disp, sqid);
 #else
 	return disp->first_worker_id + disp->io_worker_turn;
 #endif
@@ -48,6 +46,46 @@ static inline size_t __cmd_io_size(struct nvme_rw_command *cmd)
 	return (cmd->length + 1) << LBA_BITS;
 }
 
+static inline void *__map_prp_page(u64 paddr, bool *is_memremap, bool *is_kmapped)
+{
+	struct page *page;
+	void *vaddr;
+
+	*is_memremap = false;
+	*is_kmapped = false;
+
+	if (pfn_valid(paddr >> PAGE_SHIFT)) {
+		page = pfn_to_page(PRP_PFN(paddr));
+		vaddr = page_address(page);
+		if (vaddr != NULL)
+			return vaddr;
+
+		*is_kmapped = true;
+		return kmap_atomic_pfn(PRP_PFN(paddr));
+	}
+
+	*is_memremap = true;
+	return memremap(paddr & PAGE_MASK, PAGE_SIZE, MEMREMAP_WT);
+}
+
+static inline void __unmap_prp_page(void *vaddr, bool is_memremap, bool is_kmapped)
+{
+	if (vaddr == NULL)
+		return;
+
+	if (is_memremap)
+		memunmap(vaddr);
+	else if (is_kmapped)
+		kunmap_atomic(vaddr);
+}
+
+static inline bool __is_single_prp_io(struct nvme_rw_command *cmd, size_t length)
+{
+	size_t page_offs = cmd->prp1 & PAGE_OFFSET_MASK;
+
+	return length <= PAGE_SIZE && page_offs + length <= PAGE_SIZE;
+}
+
 static unsigned int __do_perform_io(int sqid, int sq_entry)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
@@ -58,18 +96,43 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 	int prp2_offs = 0;
 	u64 paddr;
 	u64 *paddr_list = NULL;
+	void *paddr_page = NULL;
 	size_t nsid = cmd->nsid - 1; // 0-based
 	bool is_paddr_memremap = false;
+	bool is_paddr_kmapped = false;
 
 	offset = __cmd_io_offset(cmd);
 	length = __cmd_io_size(cmd);
 	remaining = length;
 
+	if (likely(__is_single_prp_io(cmd, length))) {
+		void *page_base;
+		void *host_vaddr;
+		size_t page_offs = cmd->prp1 & PAGE_OFFSET_MASK;
+		bool is_memremap = false;
+		bool is_kmapped = false;
+
+		page_base = __map_prp_page(cmd->prp1, &is_memremap, &is_kmapped);
+		host_vaddr = page_base + page_offs;
+
+		if (cmd->opcode == nvme_cmd_write ||
+		    cmd->opcode == nvme_cmd_zone_append) {
+			memcpy(nvmev_vdev->ns[nsid].mapped + offset, host_vaddr, length);
+		} else if (cmd->opcode == nvme_cmd_read) {
+			memcpy(host_vaddr, nvmev_vdev->ns[nsid].mapped + offset, length);
+		}
+
+		__unmap_prp_page(page_base, is_memremap, is_kmapped);
+		return length;
+	}
+
 	while (remaining) {
 		size_t io_size;
+		void *page_base;
 		void *vaddr;
 		size_t mem_offs = 0;
 		bool is_vaddr_memremap = false;
+		bool is_vaddr_kmapped = false;
 
 		prp_offs++;
 		if (prp_offs == 1) {
@@ -77,25 +140,13 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 		} else if (prp_offs == 2) {
 			paddr = cmd->prp2;
 			if (remaining > PAGE_SIZE) {
-				if (pfn_valid(paddr >> PAGE_SHIFT)) {
-					paddr_list = kmap_atomic_pfn(PRP_PFN(paddr)) +
-						(paddr & PAGE_OFFSET_MASK);
-				} else {
-					paddr_list = memremap(paddr, PAGE_SIZE, MEMREMAP_WT);
-					paddr_list += (paddr & PAGE_OFFSET_MASK);
-					is_paddr_memremap = true;
-				}
+				paddr_page = __map_prp_page(paddr, &is_paddr_memremap,
+							    &is_paddr_kmapped);
+				paddr_list = paddr_page + (paddr & PAGE_OFFSET_MASK);
 				paddr = paddr_list[prp2_offs++];
 			}
 		} else {
 			paddr = paddr_list[prp2_offs++];
-		}
-
-		if (pfn_valid(paddr >> PAGE_SHIFT)) {
-			vaddr = kmap_atomic_pfn(PRP_PFN(paddr));
-		} else {
-			vaddr = memremap(paddr, PAGE_SIZE, MEMREMAP_WT);
-			is_vaddr_memremap = true;
 		}
 
 		io_size = min_t(size_t, remaining, PAGE_SIZE);
@@ -106,32 +157,23 @@ static unsigned int __do_perform_io(int sqid, int sq_entry)
 				io_size = PAGE_SIZE - mem_offs;
 		}
 
+		page_base = __map_prp_page(paddr, &is_vaddr_memremap, &is_vaddr_kmapped);
+		vaddr = page_base + mem_offs;
+
 		if (cmd->opcode == nvme_cmd_write ||
 		    cmd->opcode == nvme_cmd_zone_append) {
-			memcpy(nvmev_vdev->ns[nsid].mapped + offset, vaddr + mem_offs, io_size);
+			memcpy(nvmev_vdev->ns[nsid].mapped + offset, vaddr, io_size);
 		} else if (cmd->opcode == nvme_cmd_read) {
-			memcpy(vaddr + mem_offs, nvmev_vdev->ns[nsid].mapped + offset, io_size);
+			memcpy(vaddr, nvmev_vdev->ns[nsid].mapped + offset, io_size);
 		}
 
-		if (vaddr != NULL && !is_vaddr_memremap) {
-			kunmap_atomic(vaddr);
-			vaddr = NULL;
-		} else if (vaddr != NULL && is_vaddr_memremap) {
-			memunmap(vaddr);
-			vaddr = NULL;
-			is_vaddr_memremap = false;
-		}
+		__unmap_prp_page(page_base, is_vaddr_memremap, is_vaddr_kmapped);
 
 		remaining -= io_size;
 		offset += io_size;
 	}
 
-	if (paddr_list) {
-		if (!is_paddr_memremap) 
-			kunmap_atomic(paddr_list);
-		else if (is_paddr_memremap) 
-			memunmap(paddr_list);
-	}
+	__unmap_prp_page(paddr_page, is_paddr_memremap, is_paddr_kmapped);
 	paddr_list = NULL;
 
 	return length;
@@ -151,9 +193,11 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 	int num_prps = 0;
 	u64 paddr;
 	u64 *tmp_paddr_list = NULL;
+	void *tmp_paddr_page = NULL;
 	size_t io_size;
 	size_t mem_offs = 0;
 	bool is_memremap = false;
+	bool is_kmapped = false;
 
 	offset = __cmd_io_offset(cmd);
 	length = __cmd_io_size(cmd);
@@ -170,14 +214,11 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 		} else if (prp_offs == 2) {
 			paddr_list[prp_offs] = cmd->prp2;
 			if (remaining > PAGE_SIZE) {
-				if (pfn_valid(paddr_list[prp_offs] >> PAGE_SHIFT)) {
- 					tmp_paddr_list = kmap_atomic_pfn(PRP_PFN(paddr_list[prp_offs])) + 
-							(paddr_list[prp_offs] & PAGE_OFFSET_MASK);
- 				} else {
- 					tmp_paddr_list = memremap(paddr_list[prp_offs], PAGE_SIZE, MEMREMAP_WT);
- 					tmp_paddr_list += (paddr_list[prp_offs] & PAGE_OFFSET_MASK);
- 					is_memremap = true;
- 				}
+				tmp_paddr_page = __map_prp_page(paddr_list[prp_offs],
+								&is_memremap,
+								&is_kmapped);
+				tmp_paddr_list =
+					tmp_paddr_page + (paddr_list[prp_offs] & PAGE_OFFSET_MASK);
 				paddr_list[prp_offs] = tmp_paddr_list[prp2_offs++];
 			}
 		} else {
@@ -196,12 +237,7 @@ static unsigned int __do_perform_io_using_dma(int sqid, int sq_entry)
 	}
 	num_prps = prp_offs;
 
-	if (tmp_paddr_list != NULL && !is_memremap) {
- 		kunmap_atomic(tmp_paddr_list);
- 	} else if (tmp_paddr_list != NULL && is_memremap) {
- 		memunmap(tmp_paddr_list);
- 		is_memremap = false;
- 	}
+	__unmap_prp_page(tmp_paddr_page, is_memremap, is_kmapped);
 
 	remaining = length;
 	prp_offs = 1;
@@ -302,6 +338,8 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(
 	struct nvmev_io_work *w = worker->work_queue + e;
 
 	if (w->next >= NR_MAX_PARALLEL_IO) {
+		if (unlikely(debug))
+			disp->profile.alloc_reclaim_failures++;
 		WARN_ON_ONCE("IO queue is almost full");
 		return NULL;
 	}
@@ -354,6 +392,8 @@ static void __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, int sqid, int cq
 	w->is_internal = false;
 	mb(); /* IO worker shall see the updated w at once */
 
+	if (unlikely(debug))
+		disp->profile.sorted_enqueues++;
 	__insert_req_sorted(entry, worker, ret->nsecs_target);
 }
 
@@ -397,6 +437,11 @@ static void __reclaim_completed_reqs(struct nvmev_dispatcher_ctx *disp)
 	unsigned int turn;
 	unsigned int first_wid = disp->first_worker_id;
 	unsigned int last_wid = first_wid + disp->nr_workers;
+	unsigned int total_reclaimed = 0;
+	unsigned long long reclaim_start = 0;
+
+	if (unlikely(debug))
+		reclaim_start = local_clock();
 
 	for (turn = first_wid; turn < last_wid; turn++) {
 		struct nvmev_io_worker *worker;
@@ -424,25 +469,85 @@ static void __reclaim_completed_reqs(struct nvmev_dispatcher_ctx *disp)
 			}
 		}
 
-		if (last_entry != -1) {
-			w = &worker->work_queue[last_entry];
-			worker->io_seq = w->next;
-			if (w->next != -1) {
-				worker->work_queue[w->next].prev = -1;
+			if (last_entry != -1) {
+				w = &worker->work_queue[last_entry];
+				worker->io_seq = w->next;
+				if (w->next != -1) {
+					worker->work_queue[w->next].prev = -1;
+				}
+				w->next = -1;
+
+				w = &worker->work_queue[first_entry];
+				w->prev = worker->free_seq_end;
+
+				w = &worker->work_queue[worker->free_seq_end];
+				w->next = first_entry;
+
+				worker->free_seq_end = last_entry;
+				total_reclaimed += nr_reclaimed;
+				NVMEV_DEBUG_VERBOSE("%s: %u -- %u, %d\n", __func__,
+						    first_entry, last_entry, nr_reclaimed);
 			}
-			w->next = -1;
-
-			w = &worker->work_queue[first_entry];
-			w->prev = worker->free_seq_end;
-
-			w = &worker->work_queue[worker->free_seq_end];
-			w->next = first_entry;
-
-			worker->free_seq_end = last_entry;
-			NVMEV_DEBUG_VERBOSE("%s: %u -- %u, %d\n", __func__,
-					first_entry, last_entry, nr_reclaimed);
 		}
+
+	if (unlikely(debug)) {
+		disp->profile.reclaim_calls++;
+		disp->profile.reclaim_ns += local_clock() - reclaim_start;
+		disp->profile.reclaimed_entries += total_reclaimed;
 	}
+}
+
+static void __enqueue_pending_cq(struct nvmev_io_worker *worker, unsigned int cqid)
+{
+	unsigned long flags;
+
+	if (unlikely(cqid > NR_MAX_IO_QUEUE))
+		return;
+
+	spin_lock_irqsave(&worker->pending_cq_lock, flags);
+
+	if (worker->pending_cq_enqueued[cqid]) {
+		spin_unlock_irqrestore(&worker->pending_cq_lock, flags);
+		return;
+	}
+
+	worker->pending_cq_enqueued[cqid] = true;
+	worker->pending_cq_next[cqid] = -1;
+
+	if (worker->pending_cq_tail == -1) {
+		worker->pending_cq_head = cqid;
+		worker->pending_cq_tail = cqid;
+	} else {
+		worker->pending_cq_next[worker->pending_cq_tail] = cqid;
+		worker->pending_cq_tail = cqid;
+	}
+
+	spin_unlock_irqrestore(&worker->pending_cq_lock, flags);
+}
+
+static int __dequeue_pending_cq(struct nvmev_io_worker *worker)
+{
+	unsigned long flags;
+	unsigned int cqid;
+
+	spin_lock_irqsave(&worker->pending_cq_lock, flags);
+
+	cqid = worker->pending_cq_head;
+	if (cqid == -1) {
+		spin_unlock_irqrestore(&worker->pending_cq_lock, flags);
+		return -1;
+	}
+
+	worker->pending_cq_head = worker->pending_cq_next[cqid];
+	if (worker->pending_cq_head == -1)
+		worker->pending_cq_tail = -1;
+
+	worker->pending_cq_next[cqid] = -1;
+	worker->pending_cq_enqueued[cqid] = false;
+
+	spin_unlock_irqrestore(&worker->pending_cq_lock, flags);
+
+	return cqid;
 }
 
 static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int sq_entry,
@@ -450,6 +555,7 @@ static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int s
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	unsigned long long nsecs_start = __get_wallclock(disp->cpu_nr);
+	unsigned long long prof_start = 0;
 	struct nvme_command *cmd = &sq_entry(sq_entry);
 #if (BASE_SSD == KV_PROTOTYPE)
 	uint32_t nsid = 0;
@@ -479,15 +585,24 @@ static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int s
 	static unsigned long long counter = 0;
 #endif
 
+	if (unlikely(debug))
+		prof_start = local_clock();
+
 	if (!ns->proc_io_cmd(ns, &req, &ret))
 		return false;
+	if (unlikely(debug))
+		disp->profile.proc_io_ns += local_clock() - prof_start;
 	*io_size = __cmd_io_size(&sq_entry(sq_entry).rw);
 
 #ifdef PERF_DEBUG
 	prev_clock2 = local_clock();
 #endif
 
+	if (unlikely(debug))
+		prof_start = local_clock();
 	__enqueue_io_req(disp, sqid, sq->cqid, sq_entry, nsecs_start, &ret);
+	if (unlikely(debug))
+		disp->profile.enqueue_ns += local_clock() - prof_start;
 
 #ifdef PERF_DEBUG
 	prev_clock3 = local_clock();
@@ -528,6 +643,9 @@ int nvmev_proc_io_sq(struct nvmev_dispatcher_ctx *disp_ctx, int sqid, int new_db
 	if (unlikely(num_proc < 0))
 		num_proc += sq->queue_size;
 
+	if (unlikely(debug))
+		disp_ctx->profile.sq_batches++;
+
 	for (seq = 0; seq < num_proc; seq++) {
 		size_t io_size;
 		if (!__nvmev_proc_io(disp_ctx, sqid, sq_entry, &io_size))
@@ -540,6 +658,8 @@ int nvmev_proc_io_sq(struct nvmev_dispatcher_ctx *disp_ctx, int sqid, int new_db
 		sq->stat.nr_in_flight++;
 		sq->stat.total_io += io_size;
 	}
+	if (unlikely(debug))
+		disp_ctx->profile.sq_entries += seq;
 	sq->stat.nr_dispatch++;
 	sq->stat.max_nr_in_flight = max_t(int, sq->stat.max_nr_in_flight, sq->stat.nr_in_flight);
 
@@ -570,7 +690,7 @@ void nvmev_proc_io_cq(int cqid, int new_db, int old_db)
 		cq->cq_tail = cq->queue_size - 1;
 }
 
-static void __fill_cq_result(struct nvmev_io_work *w)
+static void __fill_cq_result(struct nvmev_io_worker *worker, struct nvmev_io_work *w)
 {
 	int sqid = w->sqid;
 	int cqid = w->cqid;
@@ -582,7 +702,16 @@ static void __fill_cq_result(struct nvmev_io_work *w)
 
 	struct nvmev_completion_queue *cq = nvmev_vdev->cqes[cqid];
 	struct nvme_completion *cqe;
+	struct nvmev_io_worker *irq_worker;
 	int cq_head;
+	bool need_pending_irq = false;
+
+	if (unlikely(!cq))
+		return;
+
+	irq_worker = worker;
+	if (cq->worker_id != worker->id)
+		irq_worker = &nvmev_vdev->io_workers[cq->worker_id];
 
 	spin_lock(&cq->entry_lock);
 	cq_head = cq->cq_head;
@@ -601,8 +730,12 @@ static void __fill_cq_result(struct nvmev_io_work *w)
 	}
 
 	cq->cq_head = cq_head;
+	need_pending_irq = cq->irq_enabled && !cq->interrupt_ready;
 	cq->interrupt_ready = true;
 	spin_unlock(&cq->entry_lock);
+
+	if (need_pending_irq)
+		__enqueue_pending_cq(irq_worker, cqid);
 }
 
 static int nvmev_io_worker(void *data)
@@ -625,14 +758,21 @@ static int nvmev_io_worker(void *data)
 		unsigned long long curr_nsecs_wall = __get_wallclock(worker->cpu_nr_dispatcher);
 		unsigned long long curr_nsecs_local = local_clock();
 		long long delta = curr_nsecs_wall - curr_nsecs_local;
+		unsigned long long prof_start = 0;
 
 		volatile unsigned int curr = worker->io_seq;
 		int qidx;
+
+		if (unlikely(debug))
+			worker->profile.loops++;
 
 		while (curr != -1) {
 			struct nvmev_io_work *w = &worker->work_queue[curr];
 			unsigned long long curr_nsecs = local_clock() + delta;
 			worker->latest_nsecs = curr_nsecs;
+
+			if (unlikely(debug))
+				worker->profile.scanned_entries++;
 
 			if (w->is_completed == true) {
 				curr = w->next;
@@ -640,6 +780,8 @@ static int nvmev_io_worker(void *data)
 			}
 
 			if (w->is_copied == false) {
+				if (unlikely(debug))
+					prof_start = local_clock();
 #ifdef PERF_DEBUG
 				w->nsecs_copy_start = local_clock() + delta;
 #endif
@@ -666,6 +808,10 @@ static int nvmev_io_worker(void *data)
 #ifdef PERF_DEBUG
 				w->nsecs_copy_done = local_clock() + delta;
 #endif
+				if (unlikely(debug)) {
+					worker->profile.copy_calls++;
+					worker->profile.copy_ns += local_clock() - prof_start;
+				}
 				w->is_copied = true;
 				last_io_time = jiffies;
 
@@ -674,13 +820,15 @@ static int nvmev_io_worker(void *data)
 			}
 
 			if (w->nsecs_target <= curr_nsecs) {
+				if (unlikely(debug))
+					prof_start = local_clock();
 				if (w->is_internal) {
 #if (SUPPORTED_SSD_TYPE(CONV) || SUPPORTED_SSD_TYPE(ZNS))
 					buffer_release((struct buffer *)w->write_buffer,
 						       w->buffs_to_release);
 #endif
 				} else {
-					__fill_cq_result(w);
+					__fill_cq_result(worker, w);
 				}
 
 				NVMEV_DEBUG_VERBOSE("%s: completed %u, %d %d %d\n", worker->thread_name, curr,
@@ -695,6 +843,10 @@ static int nvmev_io_worker(void *data)
 					     w->nsecs_cq_filled - w->nsecs_start,
 					     w->nsecs_target - w->nsecs_start);
 #endif
+				if (unlikely(debug)) {
+					worker->profile.complete_calls++;
+					worker->profile.complete_ns += local_clock() - prof_start;
+				}
 				mb(); /* Reclaimer shall see after here */
 				w->is_completed = true;
 			}
@@ -702,30 +854,32 @@ static int nvmev_io_worker(void *data)
 			curr = w->next;
 		}
 
+#ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
+		while ((qidx = __dequeue_pending_cq(worker)) != -1) {
+			struct nvmev_completion_queue *cq = nvmev_vdev->cqes[qidx];
+#else
 		for (qidx = 1; qidx <= nvmev_vdev->nr_cq; qidx++) {
 			struct nvmev_completion_queue *cq = nvmev_vdev->cqes[qidx];
-
-#ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
-			if (nvmev_dispatcher_id_for_cq(nvmev_vdev->nr_dispatchers, qidx)
-			    != worker->dispatcher_id)
-				continue;
-			{
-				struct nvmev_dispatcher_ctx *my_disp =
-					&nvmev_vdev->dispatchers[worker->dispatcher_id];
-				if (worker->id != __get_io_worker(my_disp, qidx))
-					continue;
-			}
 #endif
+
+			if (unlikely(debug))
+				worker->profile.irq_checks++;
 			if (cq == NULL || !cq->irq_enabled)
 				continue;
 
 			if (mutex_trylock(&cq->irq_lock)) {
 				if (cq->interrupt_ready == true) {
+					if (unlikely(debug))
+						prof_start = local_clock();
 #ifdef PERF_DEBUG
 					prev_clock = local_clock();
 #endif
 					cq->interrupt_ready = false;
 					nvmev_signal_irq(cq->irq_vector);
+					if (unlikely(debug)) {
+						worker->profile.irq_sent++;
+						worker->profile.irq_ns += local_clock() - prof_start;
+					}
 
 #ifdef PERF_DEBUG
 					intr_clock[qidx] += (local_clock() - prev_clock);
@@ -740,6 +894,12 @@ static int nvmev_io_worker(void *data)
 #endif
 				}
 				mutex_unlock(&cq->irq_lock);
+			} else if (unlikely(debug)) {
+				worker->profile.irq_lock_fail++;
+#ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
+				__enqueue_pending_cq(worker, qidx);
+				break;
+#endif
 			}
 		}
 		if (CONFIG_NVMEVIRT_IDLE_TIMEOUT != 0 &&
@@ -792,6 +952,11 @@ void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 		worker->free_seq_end = NR_MAX_PARALLEL_IO - 1;
 		worker->io_seq = -1;
 		worker->io_seq_end = -1;
+		spin_lock_init(&worker->pending_cq_lock);
+		worker->pending_cq_head = -1;
+		worker->pending_cq_tail = -1;
+		memset(worker->pending_cq_next, 0xff, sizeof(worker->pending_cq_next));
+		worker->nr_cq_qids = 0;
 
 		snprintf(worker->thread_name, sizeof(worker->thread_name),
 			 "nvmev_io_worker_%d", worker_id);

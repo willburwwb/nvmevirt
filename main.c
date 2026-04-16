@@ -73,7 +73,7 @@ static unsigned int io_unit_shift = 12;
 static unsigned int nr_dispatchers = 1;
 
 static char *cpus;
-static unsigned int debug = 0;
+unsigned int debug = 0;
 
 int io_using_dma = false;
 
@@ -117,12 +117,12 @@ module_param(debug, uint, 0644);
 
 static bool nvmev_proc_dbs(struct nvmev_dispatcher_ctx *disp_ctx)
 {
-	int qid;
 	int dbs_idx;
 	int new_db;
 	int old_db;
 	bool updated = false;
-	unsigned int nr_disp = nvmev_vdev->nr_dispatchers;
+	unsigned int idx;
+	unsigned int nr_qids;
 
 	if (disp_ctx->id == 0) {
 		new_db = nvmev_vdev->dbs[0];
@@ -139,8 +139,11 @@ static bool nvmev_proc_dbs(struct nvmev_dispatcher_ctx *disp_ctx)
 		}
 	}
 
-	for (qid = 1; qid <= nvmev_vdev->nr_sq; qid++) {
-		if (nvmev_dispatcher_id_for_sq(nr_disp, qid) != disp_ctx->id)
+	nr_qids = READ_ONCE(disp_ctx->nr_sq_qids);
+	for (idx = 0; idx < nr_qids; idx++) {
+		unsigned int qid = READ_ONCE(disp_ctx->sq_qids[idx]);
+
+		if (qid == 0 || qid > nvmev_vdev->nr_sq)
 			continue;
 		if (nvmev_vdev->sqes[qid] == NULL)
 			continue;
@@ -154,8 +157,11 @@ static bool nvmev_proc_dbs(struct nvmev_dispatcher_ctx *disp_ctx)
 		}
 	}
 
-	for (qid = 1; qid <= nvmev_vdev->nr_cq; qid++) {
-		if (nvmev_dispatcher_id_for_cq(nr_disp, qid) != disp_ctx->id)
+	nr_qids = READ_ONCE(disp_ctx->nr_cq_qids);
+	for (idx = 0; idx < nr_qids; idx++) {
+		unsigned int qid = READ_ONCE(disp_ctx->cq_qids[idx]);
+
+		if (qid == 0 || qid > nvmev_vdev->nr_cq)
 			continue;
 		if (nvmev_vdev->cqes[qid] == NULL)
 			continue;
@@ -184,10 +190,21 @@ static int nvmev_dispatcher(void *data)
 		   disp_ctx->first_worker_id + disp_ctx->nr_workers - 1);
 
 	while (!kthread_should_stop()) {
-		if (disp_ctx->id == 0 && nvmev_proc_bars())
+		bool updated = false;
+
+		if (unlikely(debug))
+			disp_ctx->profile.loops++;
+
+		if (disp_ctx->id == 0 && nvmev_proc_bars()) {
 			last_dispatched_time = jiffies;
-		if (nvmev_proc_dbs(disp_ctx))
+			updated = true;
+		}
+		if (nvmev_proc_dbs(disp_ctx)) {
 			last_dispatched_time = jiffies;
+			updated = true;
+		}
+		if (unlikely(debug) && updated)
+			disp_ctx->profile.active_loops++;
 
 		if (CONFIG_NVMEVIRT_IDLE_TIMEOUT != 0 &&
 		    time_after(jiffies, last_dispatched_time + (CONFIG_NVMEVIRT_IDLE_TIMEOUT * HZ)))
@@ -219,6 +236,8 @@ static void NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
 		disp->first_worker_id = worker_offset;
 		disp->nr_workers = workers_per_disp + (i < extra_workers ? 1 : 0);
 		disp->io_worker_turn = 0;
+		disp->nr_sq_qids = 0;
+		disp->nr_cq_qids = 0;
 
 		snprintf(disp->thread_name, sizeof(disp->thread_name),
 			 "nvmev_dispatcher_%u", i);
@@ -349,6 +368,26 @@ static int __get_nr_entries(int dbs_idx, int queue_size)
 	return diff;
 }
 
+static void __reset_debug_stats(void)
+{
+	unsigned int i;
+
+	if (!nvmev_vdev)
+		return;
+
+	if (nvmev_vdev->dispatchers != NULL) {
+		for (i = 0; i < nvmev_vdev->nr_dispatchers; i++)
+			memset(&nvmev_vdev->dispatchers[i].profile, 0x0,
+			       sizeof(nvmev_vdev->dispatchers[i].profile));
+	}
+
+	if (nvmev_vdev->io_workers != NULL) {
+		for (i = 0; i < nvmev_vdev->config.nr_io_workers; i++)
+			memset(&nvmev_vdev->io_workers[i].profile, 0x0,
+			       sizeof(nvmev_vdev->io_workers[i].profile));
+	}
+}
+
 static int __proc_file_read(struct seq_file *m, void *data)
 {
 	const char *filename = m->private;
@@ -389,7 +428,60 @@ static int __proc_file_read(struct seq_file *m, void *data)
 		seq_printf(m, "total: %u %u %u %llu\n", nr_in_flight, nr_dispatch, nr_dispatched,
 			   total_io);
 	} else if (strcmp(filename, "debug") == 0) {
-		/* Left for later use */
+		unsigned int i;
+
+		seq_printf(m, "enabled %u\n", debug);
+		seq_puts(m, "dispatcher id loops active sq_batches sq_entries avg_proc_io_ns "
+			    "avg_enqueue_ns reclaim_calls avg_reclaim_ns reclaimed immediate "
+			    "sorted alloc_reclaim alloc_reclaim_fail\n");
+		if (nvmev_vdev->dispatchers != NULL) {
+			for (i = 0; i < nvmev_vdev->nr_dispatchers; i++) {
+				struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[i];
+				struct nvmev_dispatcher_profile *p = &disp->profile;
+				unsigned long long avg_proc =
+					p->sq_entries ? div64_u64(p->proc_io_ns, p->sq_entries) : 0;
+				unsigned long long avg_enqueue =
+					p->sq_entries ? div64_u64(p->enqueue_ns, p->sq_entries) : 0;
+				unsigned long long avg_reclaim =
+					p->reclaim_calls ? div64_u64(p->reclaim_ns,
+								      p->reclaim_calls) : 0;
+
+				seq_printf(m,
+					   "dispatcher %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+					   i, p->loops, p->active_loops, p->sq_batches,
+					   p->sq_entries, avg_proc, avg_enqueue,
+					   p->reclaim_calls, avg_reclaim,
+					   p->reclaimed_entries, p->immediate_enqueues,
+					   p->sorted_enqueues, p->alloc_reclaim_calls,
+					   p->alloc_reclaim_failures);
+			}
+		}
+
+		seq_puts(m, "worker id loops scanned avg_scanned copy_calls avg_copy_ns "
+			    "complete_calls avg_complete_ns irq_checks irq_sent avg_irq_ns "
+			    "irq_lock_fail\n");
+		if (nvmev_vdev->io_workers != NULL) {
+			for (i = 0; i < nvmev_vdev->config.nr_io_workers; i++) {
+				struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[i];
+				struct nvmev_io_worker_profile *p = &worker->profile;
+				unsigned long long avg_scanned =
+					p->loops ? div64_u64(p->scanned_entries, p->loops) : 0;
+				unsigned long long avg_copy =
+					p->copy_calls ? div64_u64(p->copy_ns, p->copy_calls) : 0;
+				unsigned long long avg_complete =
+					p->complete_calls ? div64_u64(p->complete_ns,
+								      p->complete_calls) : 0;
+				unsigned long long avg_irq =
+					p->irq_sent ? div64_u64(p->irq_ns, p->irq_sent) : 0;
+
+				seq_printf(m,
+					   "worker %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
+					   i, p->loops, p->scanned_entries, avg_scanned,
+					   p->copy_calls, avg_copy, p->complete_calls,
+					   avg_complete, p->irq_checks, p->irq_sent,
+					   avg_irq, p->irq_lock_fail);
+			}
+		}
 	}
 
 	return 0;
@@ -402,11 +494,15 @@ static ssize_t __proc_file_write(struct file *file, const char __user *buf, size
 	const char *filename = file->f_path.dentry->d_name.name;
 	char input[128];
 	unsigned int ret;
+	unsigned int new_debug;
 	unsigned long long *old_stat;
 	struct nvmev_config *cfg = &nvmev_vdev->config;
 	size_t nr_copied;
+	size_t input_len;
 
-	nr_copied = copy_from_user(input, buf, min(len, sizeof(input)));
+	input_len = min(len, sizeof(input) - 1);
+	nr_copied = copy_from_user(input, buf, input_len);
+	input[input_len - nr_copied] = '\0';
 
 	if (!strcmp(filename, "read_times")) {
 		ret = sscanf(input, "%u %u %u", &cfg->read_delay, &cfg->read_time,
@@ -439,7 +535,12 @@ static ssize_t __proc_file_write(struct file *file, const char __user *buf, size
 			memset(&sq->stat, 0x00, sizeof(sq->stat));
 		}
 	} else if (!strcmp(filename, "debug")) {
-		/* Left for later use */
+		if (sysfs_streq(input, "reset")) {
+			__reset_debug_stats();
+		} else if (kstrtouint(input, 0, &new_debug) == 0) {
+			debug = new_debug;
+			__reset_debug_stats();
+		}
 	}
 
 out:
@@ -495,7 +596,7 @@ static void NVMEV_STORAGE_INIT(struct nvmev_dev *nvmev_vdev)
 	nvmev_vdev->proc_io_units =
 		proc_create("io_units", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 	nvmev_vdev->proc_stat = proc_create("stat", 0444, nvmev_vdev->proc_root, &proc_file_fops);
-	nvmev_vdev->proc_debug = proc_create("debug", 0444, nvmev_vdev->proc_root, &proc_file_fops);
+	nvmev_vdev->proc_debug = proc_create("debug", 0664, nvmev_vdev->proc_root, &proc_file_fops);
 }
 
 static void NVMEV_STORAGE_FINAL(struct nvmev_dev *nvmev_vdev)

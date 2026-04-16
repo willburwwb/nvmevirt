@@ -44,6 +44,93 @@ static void __make_cq_entry(int eid, u16 ret)
 /***
  * Queue managements
  */
+static void __active_qid_add(unsigned int *qids, unsigned int *nr_qids, unsigned int qid)
+{
+	unsigned int nr = READ_ONCE(*nr_qids);
+	unsigned int idx;
+
+	for (idx = 0; idx < nr; idx++) {
+		if (READ_ONCE(qids[idx]) == qid)
+			return;
+	}
+
+	if (WARN_ON_ONCE(nr >= NR_MAX_IO_QUEUE))
+		return;
+
+	WRITE_ONCE(qids[nr], qid);
+	smp_wmb();
+	WRITE_ONCE(*nr_qids, nr + 1);
+}
+
+static void __active_qid_del(unsigned int *qids, unsigned int *nr_qids, unsigned int qid)
+{
+	unsigned int nr = READ_ONCE(*nr_qids);
+	unsigned int idx;
+
+	for (idx = 0; idx < nr; idx++) {
+		if (READ_ONCE(qids[idx]) != qid)
+			continue;
+
+		WRITE_ONCE(qids[idx], READ_ONCE(qids[nr - 1]));
+		WRITE_ONCE(qids[nr - 1], 0);
+		smp_wmb();
+		WRITE_ONCE(*nr_qids, nr - 1);
+		return;
+	}
+}
+
+static void __nvmev_register_sq(unsigned int qid)
+{
+	struct nvmev_dispatcher_ctx *disp;
+	unsigned int disp_id;
+
+	disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, qid);
+	disp = &nvmev_vdev->dispatchers[disp_id];
+	__active_qid_add(disp->sq_qids, &disp->nr_sq_qids, qid);
+}
+
+static void __nvmev_unregister_sq(unsigned int qid)
+{
+	struct nvmev_dispatcher_ctx *disp;
+	unsigned int disp_id;
+
+	disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, qid);
+	disp = &nvmev_vdev->dispatchers[disp_id];
+	__active_qid_del(disp->sq_qids, &disp->nr_sq_qids, qid);
+}
+
+static void __nvmev_register_cq(unsigned int qid)
+{
+	struct nvmev_dispatcher_ctx *disp;
+	struct nvmev_io_worker *worker;
+	unsigned int disp_id;
+	unsigned int worker_id;
+
+	disp_id = nvmev_dispatcher_id_for_cq(nvmev_vdev->nr_dispatchers, qid);
+	disp = &nvmev_vdev->dispatchers[disp_id];
+	worker_id = nvmev_io_worker_id_for_queue(disp, qid);
+	worker = &nvmev_vdev->io_workers[worker_id];
+
+	__active_qid_add(disp->cq_qids, &disp->nr_cq_qids, qid);
+	__active_qid_add(worker->cq_qids, &worker->nr_cq_qids, qid);
+}
+
+static void __nvmev_unregister_cq(unsigned int qid)
+{
+	struct nvmev_dispatcher_ctx *disp;
+	struct nvmev_io_worker *worker;
+	unsigned int disp_id;
+	unsigned int worker_id;
+
+	disp_id = nvmev_dispatcher_id_for_cq(nvmev_vdev->nr_dispatchers, qid);
+	disp = &nvmev_vdev->dispatchers[disp_id];
+	worker_id = nvmev_io_worker_id_for_queue(disp, qid);
+	worker = &nvmev_vdev->io_workers[worker_id];
+
+	__active_qid_del(disp->cq_qids, &disp->nr_cq_qids, qid);
+	__active_qid_del(worker->cq_qids, &worker->nr_cq_qids, qid);
+}
+
 static void __nvmev_admin_create_cq(int eid)
 {
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
@@ -67,6 +154,9 @@ static void __nvmev_admin_create_cq(int eid)
 
 	cq->cq_head = 0;
 	cq->cq_tail = -1;
+	cq->dispatcher_id = nvmev_dispatcher_id_for_cq(nvmev_vdev->nr_dispatchers, cq->qid);
+	cq->worker_id =
+		nvmev_io_worker_id_for_queue(&nvmev_vdev->dispatchers[cq->dispatcher_id], cq->qid);
 
 	spin_lock_init(&cq->entry_lock);
 	mutex_init(&cq->irq_lock);
@@ -92,6 +182,7 @@ static void __nvmev_admin_create_cq(int eid)
 
 	dbs_idx = cq->qid * 2 + 1;
 	nvmev_vdev->dbs[dbs_idx] = nvmev_vdev->old_dbs[dbs_idx] = 0;
+	__nvmev_register_cq(cq->qid);
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
@@ -106,6 +197,7 @@ static void __nvmev_admin_delete_cq(int eid)
 
 	cq = nvmev_vdev->cqes[qid];
 	nvmev_vdev->cqes[qid] = NULL;
+	__nvmev_unregister_cq(qid);
 
 	if (cq) {
 		kfree(cq->cq);
@@ -155,6 +247,7 @@ static void __nvmev_admin_create_sq(int eid)
 	dbs_idx = sq->qid * 2;
 	nvmev_vdev->dbs[dbs_idx] = 0;
 	nvmev_vdev->old_dbs[dbs_idx] = 0;
+	__nvmev_register_sq(sq->qid);
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
@@ -170,6 +263,7 @@ static void __nvmev_admin_delete_sq(int eid)
 
 	sq = nvmev_vdev->sqes[qid];
 	nvmev_vdev->sqes[qid] = NULL;
+	__nvmev_unregister_sq(qid);
 
 	if (sq) {
 		kfree(sq->sq);

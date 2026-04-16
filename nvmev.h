@@ -54,7 +54,7 @@
 #endif
 
 
-#define NR_MAX_IO_QUEUE 128
+#define NR_MAX_IO_QUEUE 256
 #define NR_MAX_PARALLEL_IO 16384
 #define NR_MAX_DISPATCHERS 8
 
@@ -112,6 +112,8 @@ struct nvmev_completion_queue {
 	bool irq_enabled;
 	bool interrupt_ready;
 	bool phys_contig;
+	unsigned int dispatcher_id;
+	unsigned int worker_id;
 
 	spinlock_t entry_lock;
 	struct mutex irq_lock;
@@ -146,6 +148,35 @@ struct nvmev_admin_queue {
 
 #define SQ_ENTRY_TO_PAGE_OFFSET(entry_id) (entry_id % NR_SQE_PER_PAGE)
 #define CQ_ENTRY_TO_PAGE_OFFSET(entry_id) (entry_id % NR_CQE_PER_PAGE)
+
+struct nvmev_dispatcher_profile {
+	unsigned long long loops;
+	unsigned long long active_loops;
+	unsigned long long sq_batches;
+	unsigned long long sq_entries;
+	unsigned long long proc_io_ns;
+	unsigned long long enqueue_ns;
+	unsigned long long reclaim_ns;
+	unsigned long long reclaim_calls;
+	unsigned long long reclaimed_entries;
+	unsigned long long immediate_enqueues;
+	unsigned long long sorted_enqueues;
+	unsigned long long alloc_reclaim_calls;
+	unsigned long long alloc_reclaim_failures;
+};
+
+struct nvmev_io_worker_profile {
+	unsigned long long loops;
+	unsigned long long scanned_entries;
+	unsigned long long copy_calls;
+	unsigned long long copy_ns;
+	unsigned long long complete_calls;
+	unsigned long long complete_ns;
+	unsigned long long irq_checks;
+	unsigned long long irq_sent;
+	unsigned long long irq_lock_fail;
+	unsigned long long irq_ns;
+};
 
 struct nvmev_config {
 	unsigned long memmap_start; // byte
@@ -207,6 +238,14 @@ struct nvmev_io_worker {
 	unsigned int free_seq_end; /* free io req tail index */
 	unsigned int io_seq; /* io req head index */
 	unsigned int io_seq_end; /* io req tail index */
+	spinlock_t pending_cq_lock;
+	unsigned int pending_cq_head;
+	unsigned int pending_cq_tail;
+	unsigned int pending_cq_next[NR_MAX_IO_QUEUE + 1];
+	bool pending_cq_enqueued[NR_MAX_IO_QUEUE + 1];
+	unsigned int cq_qids[NR_MAX_IO_QUEUE];
+	unsigned int nr_cq_qids;
+	struct nvmev_io_worker_profile profile;
 
 	unsigned long long latest_nsecs;
 
@@ -225,6 +264,11 @@ struct nvmev_dispatcher_ctx {
 	unsigned int first_worker_id;
 	unsigned int nr_workers;
 	unsigned int io_worker_turn;
+	unsigned int sq_qids[NR_MAX_IO_QUEUE];
+	unsigned int nr_sq_qids;
+	unsigned int cq_qids[NR_MAX_IO_QUEUE];
+	unsigned int nr_cq_qids;
+	struct nvmev_dispatcher_profile profile;
 	char thread_name[32];
 };
 
@@ -313,6 +357,7 @@ struct nvmev_ns {
 
 // VDEV Init, Final Function
 extern struct nvmev_dev *nvmev_vdev;
+extern unsigned int debug;
 struct nvmev_dev *VDEV_INIT(void);
 void VDEV_FINALIZE(struct nvmev_dev *nvmev_vdev);
 
@@ -342,6 +387,18 @@ static inline unsigned int nvmev_dispatcher_id_for_sq(unsigned int nr_dispatcher
 static inline unsigned int nvmev_dispatcher_id_for_cq(unsigned int nr_dispatchers, int cqid)
 {
 	return (cqid - 1) % nr_dispatchers;
+}
+
+static inline unsigned int nvmev_io_worker_id_for_queue(struct nvmev_dispatcher_ctx *disp, int qid)
+{
+	if (unlikely(disp->nr_workers == 0))
+		return disp->first_worker_id;
+#ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
+	return disp->first_worker_id +
+	       (((qid - 1) / nvmev_vdev->nr_dispatchers) % disp->nr_workers);
+#else
+	return disp->first_worker_id + ((qid - 1) % disp->nr_workers);
+#endif
 }
 
 #endif /* _LIB_NVMEV_H */
