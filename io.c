@@ -305,7 +305,9 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(
 	if (w->next >= NR_MAX_PARALLEL_IO) {
 		if (unlikely(debug))
 			disp->profile.alloc_reclaim_failures++;
-		WARN_ON_ONCE("IO queue is almost full");
+		printk_ratelimited(KERN_WARNING
+				   "%s: worker %u work queue is full for sqid %d, throttling dispatcher\n",
+				   NVMEV_DRV_NAME, worker->id, sqid);
 		return NULL;
 	}
 
@@ -321,7 +323,7 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(
 	return worker;
 }
 
-static void __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, int sqid, int cqid,
+static bool __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, int sqid, int cqid,
 			     int sq_entry, unsigned long long nsecs_start,
 			     struct nvmev_result *ret)
 {
@@ -332,7 +334,7 @@ static void __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, int sqid, int cq
 
 	worker = __allocate_work_queue_entry(disp, sqid, &entry);
 	if (!worker)
-		return;
+		return false;
 
 	w = worker->work_queue + entry;
 
@@ -360,6 +362,8 @@ static void __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, int sqid, int cq
 	if (unlikely(debug))
 		disp->profile.sorted_enqueues++;
 	__insert_req_sorted(entry, worker, ret->nsecs_target);
+
+	return true;
 }
 
 void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
@@ -565,7 +569,12 @@ static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int s
 
 	if (unlikely(debug))
 		prof_start = local_clock();
-	__enqueue_io_req(disp, sqid, sq->cqid, sq_entry, nsecs_start, &ret);
+	if (!__enqueue_io_req(disp, sqid, sq->cqid, sq_entry, nsecs_start, &ret)) {
+		if (unlikely(debug))
+			disp->profile.alloc_reclaim_calls++;
+		__reclaim_completed_reqs(disp);
+		return false;
+	}
 	if (unlikely(debug))
 		disp->profile.enqueue_ns += local_clock() - prof_start;
 
@@ -573,6 +582,7 @@ static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int s
 	prev_clock3 = local_clock();
 #endif
 
+	/* Reclaim after a successful enqueue so the dispatcher can keep feeding workers. */
 	__reclaim_completed_reqs(disp);
 
 #ifdef PERF_DEBUG
@@ -637,11 +647,13 @@ void nvmev_proc_io_cq(int cqid, int new_db, int old_db)
 	struct nvmev_completion_queue *cq = nvmev_vdev->cqes[cqid];
 	int i;
 	for (i = old_db; i != new_db; i++) {
-		int sqid = cq_entry(i).sq_id;
+		int sqid;
+
 		if (i >= cq->queue_size) {
 			i = -1;
 			continue;
 		}
+		sqid = cq_entry(i).sq_id;
 
 		/* Should check the validity here since SPDK deletes SQ immediately
 		 * before processing associated CQes */
@@ -666,13 +678,19 @@ static void __fill_cq_result(struct nvmev_io_worker *worker, struct nvmev_io_wor
 	unsigned int result1 = w->result1;
 
 	struct nvmev_completion_queue *cq = nvmev_vdev->cqes[cqid];
+	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 	struct nvme_completion *cqe;
 	struct nvmev_io_worker *irq_worker;
 	int cq_head;
+	int sq_head;
 	bool need_pending_irq = false;
 
-	if (unlikely(!cq))
+	if (unlikely(!cq || !sq))
 		return;
+
+	/* SQHD must track the controller's current SQ head and must not move
+	 * backwards when completions are returned out of order. */
+	sq_head = READ_ONCE(nvmev_vdev->old_dbs[sqid * 2]);
 
 	irq_worker = worker;
 	if (cq->worker_id != worker->id)
@@ -684,7 +702,11 @@ static void __fill_cq_result(struct nvmev_io_worker *worker, struct nvmev_io_wor
 
 	cqe->command_id = command_id;
 	cqe->sq_id = sqid;
-	cqe->sq_head = sq_entry;
+	/*
+	 * SQHD reports the next SQ entry the controller expects, not the
+	 * entry that just completed. SPDK uses this field to reclaim SQ slots.
+	 */
+	cqe->sq_head = sq_head;
 	cqe->status = cq->phase | (status << 1);
 	cqe->result0 = result0;
 	cqe->result1 = result1;
@@ -884,7 +906,7 @@ static int nvmev_io_worker(void *data)
 	return 0;
 }
 
-void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
+bool NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	unsigned int i, worker_id, disp_id;
 	unsigned int nr_disp = nvmev_vdev->nr_dispatchers;
@@ -912,8 +934,15 @@ void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 	for (worker_id = 0; worker_id < nr_workers; worker_id++) {
 		struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[worker_id];
 
-		worker->work_queue =
-			kzalloc(sizeof(struct nvmev_io_work) * NR_MAX_PARALLEL_IO, GFP_KERNEL);
+		worker->work_queue = kvcalloc(NR_MAX_PARALLEL_IO,
+					      sizeof(struct nvmev_io_work),
+					      GFP_KERNEL);
+		if (!worker->work_queue) {
+			NVMEV_ERROR("Failed to allocate work_queue for worker %u (%zu bytes)\n",
+				    worker_id,
+				    sizeof(struct nvmev_io_work) * (size_t)NR_MAX_PARALLEL_IO);
+			goto err_alloc;
+		}
 		for (i = 0; i < NR_MAX_PARALLEL_IO; i++) {
 			worker->work_queue[i].next = i + 1;
 			worker->work_queue[i].prev = i - 1;
@@ -940,6 +969,23 @@ void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 			     nvmev_vdev->config.cpu_nr_io_workers[worker_id]);
 		wake_up_process(worker->task_struct);
 	}
+
+	return true;
+
+err_alloc:
+	while (worker_id-- > 0) {
+		struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[worker_id];
+
+		if (!IS_ERR_OR_NULL(worker->task_struct)) {
+			kthread_stop(worker->task_struct);
+		}
+
+		kvfree(worker->work_queue);
+	}
+
+	kfree(nvmev_vdev->io_workers);
+	nvmev_vdev->io_workers = NULL;
+	return false;
 }
 
 void NVMEV_IO_WORKER_FINAL(struct nvmev_dev *nvmev_vdev)
@@ -953,7 +999,7 @@ void NVMEV_IO_WORKER_FINAL(struct nvmev_dev *nvmev_vdev)
 			kthread_stop(worker->task_struct);
 		}
 
-		kfree(worker->work_queue);
+		kvfree(worker->work_queue);
 	}
 
 	kfree(nvmev_vdev->io_workers);

@@ -817,7 +817,9 @@ static int NVMeV_init(void)
 	__print_perf_configs();
 
 	NVMEV_DISPATCHER_INIT(nvmev_vdev);
-	NVMEV_IO_WORKER_INIT(nvmev_vdev);
+	if (!NVMEV_IO_WORKER_INIT(nvmev_vdev)) {
+		goto ret_err;
+	}
 
 	pci_bus_add_devices(nvmev_vdev->virt_bus);
 

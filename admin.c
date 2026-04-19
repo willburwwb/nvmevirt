@@ -18,11 +18,20 @@ static void __make_cq_entry_results(int eid, u16 ret, u32 result0, u32 result1)
 	struct nvmev_admin_queue *queue = nvmev_vdev->admin_q;
 	struct nvme_common_command *cmd = &sq_entry(eid).common;
 	int cq_head = queue->cq_head;
+	int sq_head = eid + 1;
+
+	if (sq_head == queue->sq_depth) {
+		sq_head = 0;
+	}
 
 	cq_entry(cq_head) = (struct nvme_completion) {
 		.command_id = cmd->command_id,
 		.sq_id = 0,
-		.sq_head = eid,
+		/*
+		 * SQHD reports the next SQ entry the controller expects, not the
+		 * entry that just completed. SPDK uses this field to reclaim SQ slots.
+		 */
+		.sq_head = sq_head,
 		.result0 = result0,
 		.result1 = result1,
 		.status = queue->phase | (ret << 1),
@@ -592,6 +601,8 @@ static void __nvmev_admin_set_features(int eid)
 		// # of cq in 0-base
 		num_queue = ((sq_entry(eid).features.dword11 >> 16) & 0xFFFF) + 1;
 		nvmev_vdev->nr_cq = min(num_queue, NR_MAX_IO_QUEUE);
+
+		NVMEV_INFO("SQ CQ Number: %d, %d\n", nvmev_vdev->nr_sq, nvmev_vdev->nr_cq);
 
 		result0 = ((nvmev_vdev->nr_cq - 1) << 16 | (nvmev_vdev->nr_sq - 1));
 		break;

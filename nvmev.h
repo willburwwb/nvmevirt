@@ -55,7 +55,7 @@
 
 
 #define NR_MAX_IO_QUEUE 256
-#define NR_MAX_PARALLEL_IO 16384
+#define NR_MAX_PARALLEL_IO 65536
 #define NR_MAX_DISPATCHERS 8
 
 #define NVMEV_INTX_IRQ 15
@@ -378,7 +378,7 @@ void nvmev_proc_admin_cq(int new_db, int old_db);
 struct buffer;
 void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 				struct buffer *write_buffer, size_t buffs_to_release);
-void NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev);
+bool NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev);
 void NVMEV_IO_WORKER_FINAL(struct nvmev_dev *nvmev_vdev);
 int nvmev_proc_io_sq(struct nvmev_dispatcher_ctx *disp_ctx, int qid, int new_db, int old_db);
 void nvmev_proc_io_cq(int qid, int new_db, int old_db);
