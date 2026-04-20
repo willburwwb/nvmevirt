@@ -236,6 +236,7 @@ static void NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
 		disp->first_worker_id = worker_offset;
 		disp->nr_workers = workers_per_disp + (i < extra_workers ? 1 : 0);
 		disp->io_worker_turn = 0;
+		disp->reclaim_batch_count = 0;
 		disp->nr_sq_qids = 0;
 		disp->nr_cq_qids = 0;
 

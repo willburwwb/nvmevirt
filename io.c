@@ -17,6 +17,13 @@ struct buffer;
 
 #undef PERF_DEBUG
 
+/*
+ * Reclaiming completed requests is dispatcher-side bookkeeping. Batching it
+ * reduces front-end overhead under high IOPS while keeping queue-full recovery
+ * on the slow path.
+ */
+#define NVMEV_RECLAIM_BATCH_SIZE 16
+
 #define sq_entry(entry_id) sq->sq[SQ_ENTRY_TO_PAGE_NUM(entry_id)][SQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
 #define cq_entry(entry_id) cq->cq[CQ_ENTRY_TO_PAGE_NUM(entry_id)][CQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
 
@@ -29,6 +36,13 @@ static inline unsigned int __get_io_worker(struct nvmev_dispatcher_ctx *disp, in
 #else
 	return disp->first_worker_id + disp->io_worker_turn;
 #endif
+}
+
+static inline bool __worker_queue_full(struct nvmev_io_worker *worker)
+{
+	struct nvmev_io_work *w = worker->work_queue + worker->free_seq;
+
+	return w->next >= NR_MAX_PARALLEL_IO;
 }
 
 static inline unsigned long long __get_wallclock(unsigned int cpu_nr)
@@ -302,7 +316,7 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(
 	unsigned int e = worker->free_seq;
 	struct nvmev_io_work *w = worker->work_queue + e;
 
-	if (w->next >= NR_MAX_PARALLEL_IO) {
+	if (__worker_queue_full(worker)) {
 		if (unlikely(debug))
 			disp->profile.alloc_reclaim_failures++;
 		printk_ratelimited(KERN_WARNING
@@ -573,6 +587,7 @@ static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int s
 		if (unlikely(debug))
 			disp->profile.alloc_reclaim_calls++;
 		__reclaim_completed_reqs(disp);
+		disp->reclaim_batch_count = 0;
 		return false;
 	}
 	if (unlikely(debug))
@@ -582,8 +597,14 @@ static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int s
 	prev_clock3 = local_clock();
 #endif
 
-	/* Reclaim after a successful enqueue so the dispatcher can keep feeding workers. */
-	__reclaim_completed_reqs(disp);
+	/*
+	 * Batch reclaim work so the dispatcher doesn't pay reclaim cost on every
+	 * single I/O. The failure path above still forces reclaim immediately.
+	 */
+	if (++disp->reclaim_batch_count >= NVMEV_RECLAIM_BATCH_SIZE) {
+		__reclaim_completed_reqs(disp);
+		disp->reclaim_batch_count = 0;
+	}
 
 #ifdef PERF_DEBUG
 	prev_clock4 = local_clock();
