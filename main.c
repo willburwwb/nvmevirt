@@ -239,6 +239,7 @@ static void NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
 		disp->first_worker_id = worker_offset;
 		disp->nr_workers = workers_per_disp + (i < extra_workers ? 1 : 0);
 		disp->io_worker_turn = 0;
+		disp->reclaim_batch_count = 0;
 		disp->nr_sq_qids = 0;
 		disp->nr_cq_qids = 0;
 
@@ -375,13 +376,7 @@ static int __get_nr_entries(int dbs_idx, int queue_size)
 	return diff;
 }
 
-static unsigned int __worker_reclaim_low_watermark_debug(const struct nvmev_config *cfg)
-{
-	return max_t(unsigned int, 1,
-		     DIV_ROUND_UP(cfg->nr_max_parallel_io * 5U, 100U));
-}
-
-static unsigned int __sq_worker_hint_debug(unsigned int sqid)
+static unsigned int __sq_worker_id_debug(unsigned int sqid)
 {
 	unsigned int disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, sqid);
 	struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[disp_id];
@@ -478,11 +473,11 @@ static int __proc_file_read(struct seq_file *m, void *data)
 			}
 		}
 
-		seq_puts(m, "worker id disp cpu free inflight depth low_wm max_inflight "
-			    "dispatches cq_count low_wm_hits full_events last_full_sqid "
-			    "reclaim_calls reclaimed loops scanned avg_scanned copy_calls "
-			    "avg_copy_ns complete_calls avg_complete_ns irq_checks irq_sent "
-			    "avg_irq_ns irq_lock_fail\n");
+		seq_puts(m, "worker id disp cpu free inflight depth max_inflight "
+			    "dispatches cq_count full_events last_full_sqid reclaim_calls "
+			    "reclaimed loops scanned avg_scanned copy_calls avg_copy_ns "
+			    "complete_calls avg_complete_ns irq_checks irq_sent avg_irq_ns "
+			    "irq_lock_fail\n");
 		if (nvmev_vdev->io_workers != NULL) {
 			for (i = 0; i < nvmev_vdev->config.nr_io_workers; i++) {
 				struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[i];
@@ -500,12 +495,11 @@ static int __proc_file_read(struct seq_file *m, void *data)
 					p->irq_sent ? div64_u64(p->irq_ns, p->irq_sent) : 0;
 
 				seq_printf(m,
-					   "worker %u %u %u %u %u %u %u %llu %llu %u %llu %llu %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+					   "worker %u %u %u %u %u %u %llu %llu %u %llu %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
 					   i, worker->dispatcher_id, nvmev_vdev->config.cpu_nr_io_workers[i],
 					   nr_free_entries, inflight, cfg->nr_max_parallel_io,
-					   __worker_reclaim_low_watermark_debug(cfg), p->max_inflight,
-					   p->dispatch_calls, READ_ONCE(worker->nr_cq_qids),
-					   p->low_watermark_hits,
+					   p->max_inflight, p->dispatch_calls,
+					   READ_ONCE(worker->nr_cq_qids),
 					   p->queue_full_events, p->last_queue_full_sqid,
 					   p->reclaim_calls, p->reclaimed_entries, p->loops,
 					   p->scanned_entries, avg_scanned, p->copy_calls, avg_copy,
@@ -538,7 +532,7 @@ static int __proc_file_read(struct seq_file *m, void *data)
 			}
 		}
 
-		seq_puts(m, "sq_map sqid cqid dispatcher worker_hint host_pending "
+		seq_puts(m, "sq_map sqid cqid dispatcher worker host_pending "
 			    "sq_inflight sq_size sq_dispatch sq_dispatched\n");
 		for (i = 1; i <= nvmev_vdev->nr_sq; i++) {
 			struct nvmev_submission_queue *sq = nvmev_vdev->sqes[i];
@@ -549,7 +543,7 @@ static int __proc_file_read(struct seq_file *m, void *data)
 				continue;
 
 			disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, sq->qid);
-			worker_id = __sq_worker_hint_debug(sq->qid);
+			worker_id = __sq_worker_id_debug(sq->qid);
 			seq_printf(m, "sq_map %u %u %u %u %u %u %u %u %u\n",
 				   sq->qid, sq->cqid, disp_id, worker_id,
 				   __get_nr_entries(sq->qid * 2, sq->queue_size),

@@ -279,6 +279,7 @@ struct nvmev_dispatcher_ctx {
 	unsigned int first_worker_id;
 	unsigned int nr_workers;
 	unsigned int io_worker_turn;
+	unsigned int reclaim_batch_count;
 	unsigned int sq_qids[NR_MAX_IO_QUEUE];
 	unsigned int nr_sq_qids;
 	unsigned int cq_qids[NR_MAX_IO_QUEUE];

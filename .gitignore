@@ -176,3 +176,4 @@ Makefile.local
 *.out
 .gitignore
 *.state
+*.txt
