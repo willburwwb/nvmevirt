@@ -167,6 +167,7 @@ struct nvmev_dispatcher_profile {
 };
 
 struct nvmev_io_worker_profile {
+	unsigned long long dispatch_calls;
 	unsigned long long loops;
 	unsigned long long scanned_entries;
 	unsigned long long copy_calls;

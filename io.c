@@ -22,7 +22,7 @@ struct buffer;
  * only when the target worker is running low on allocatable queue entries so
  * the dispatcher avoids paying reclaim cost on the common path.
  */
-#define NVMEV_RECLAIM_LOW_WATERMARK_PCT 5
+#define NVMEV_RECLAIM_LOW_WATERMARK_PCT 1
 
 #define sq_entry(entry_id) sq->sq[SQ_ENTRY_TO_PAGE_NUM(entry_id)][SQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
 #define cq_entry(entry_id) cq->cq[CQ_ENTRY_TO_PAGE_NUM(entry_id)][CQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
@@ -34,13 +34,51 @@ static inline unsigned int __nvmev_max_parallel_io(void)
 	return nvmev_vdev->config.nr_max_parallel_io;
 }
 
-static inline unsigned int __get_io_worker(struct nvmev_dispatcher_ctx *disp, int sqid)
+static inline unsigned int __get_io_worker_hint(struct nvmev_dispatcher_ctx *disp, int sqid)
 {
-#ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
 	return nvmev_io_worker_id_for_queue(disp, sqid);
-#else
-	return disp->first_worker_id + disp->io_worker_turn;
+}
+
+/*
+ * Assign each SQ entry to the least-loaded worker inside the same dispatcher.
+ * A rotating start offset keeps tie-breaking fair so hot SQs do not keep
+ * collapsing onto the same worker when queue depths are identical.
+ */
+static inline struct nvmev_io_worker *__select_io_worker(struct nvmev_dispatcher_ctx *disp,
+							 int sqid)
+{
+	unsigned int nr_workers = disp->nr_workers;
+	unsigned int max_parallel_io = __nvmev_max_parallel_io();
+	unsigned int start;
+	unsigned int i;
+	unsigned int best_worker_id = disp->first_worker_id;
+	unsigned int best_free_entries = 0;
+
+	if (unlikely(nr_workers == 0))
+		return &nvmev_vdev->io_workers[disp->first_worker_id];
+
+	start = disp->io_worker_turn;
+#ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
+	start += __get_io_worker_hint(disp, sqid) - disp->first_worker_id;
+	start %= nr_workers;
 #endif
+
+	for (i = 0; i < nr_workers; i++) {
+		unsigned int rel = (start + i) % nr_workers;
+		unsigned int worker_id = disp->first_worker_id + rel;
+		struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[worker_id];
+		unsigned int nr_free_entries = worker->nr_free_entries;
+
+		if (i == 0 || nr_free_entries > best_free_entries) {
+			best_free_entries = nr_free_entries;
+			best_worker_id = worker_id;
+			if (best_free_entries == max_parallel_io)
+				break;
+		}
+	}
+
+	disp->io_worker_turn = (disp->io_worker_turn + 1) % nr_workers;
+	return &nvmev_vdev->io_workers[best_worker_id];
 }
 
 static inline bool __worker_queue_full(struct nvmev_io_worker *worker)
@@ -406,8 +444,7 @@ static void __release_work_queue_entry(struct nvmev_io_worker *worker, unsigned 
 static struct nvmev_io_worker *__allocate_work_queue_entry(
 		struct nvmev_dispatcher_ctx *disp, int sqid, unsigned int *entry)
 {
-	unsigned int io_worker_turn = __get_io_worker(disp, sqid);
-	struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[io_worker_turn];
+	struct nvmev_io_worker *worker = __select_io_worker(disp, sqid);
 	unsigned int e;
 	struct nvmev_io_work *w;
 
@@ -428,17 +465,12 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(
 		worker->profile.queue_full_events++;
 		worker->profile.last_queue_full_sqid = sqid;
 		printk_ratelimited(KERN_WARNING
-				   "%s: worker %u work queue is full for sqid %d, throttling dispatcher (free=%u inflight=%u depth=%u low_wm=%u)\n",
-				   NVMEV_DRV_NAME, worker->id, sqid, worker->nr_free_entries,
-				   inflight, __nvmev_max_parallel_io(),
+				   "%s: dispatcher %u worker pool is full for sqid %d, selected worker %u saturated (free=%u inflight=%u depth=%u low_wm=%u)\n",
+				   NVMEV_DRV_NAME, disp->id, sqid, worker->id,
+				   worker->nr_free_entries, inflight, __nvmev_max_parallel_io(),
 				   __worker_reclaim_low_watermark());
 		return NULL;
 	}
-
-#ifndef CONFIG_NVMEV_IO_WORKER_BY_SQ
-	if (++disp->io_worker_turn >= disp->nr_workers)
-		disp->io_worker_turn = 0;
-#endif
 
 	e = worker->free_seq;
 	BUG_ON(e == NVMEV_IO_WORK_INVALID);
@@ -449,6 +481,7 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(
 	else
 		worker->work_queue[worker->free_seq].prev = NVMEV_IO_WORK_INVALID;
 	worker->nr_free_entries--;
+	worker->profile.dispatch_calls++;
 	worker->profile.max_inflight = max_t(unsigned long long,
 					      worker->profile.max_inflight,
 					      __nvmev_max_parallel_io() - worker->nr_free_entries);
