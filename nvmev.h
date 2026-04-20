@@ -55,8 +55,9 @@
 
 
 #define NR_MAX_IO_QUEUE 256
-#define NR_MAX_PARALLEL_IO 65536
+#define NVMEV_NR_MAX_PARALLEL_IO_DEFAULT 65536
 #define NR_MAX_DISPATCHERS 8
+#define NVMEV_IO_WORK_INVALID ((unsigned int)-1)
 
 #define NVMEV_INTX_IRQ 15
 
@@ -170,6 +171,10 @@ struct nvmev_io_worker_profile {
 	unsigned long long scanned_entries;
 	unsigned long long copy_calls;
 	unsigned long long copy_ns;
+	unsigned long long reclaim_calls;
+	unsigned long long reclaimed_entries;
+	unsigned long long low_watermark_hits;
+	unsigned long long queue_full_events;
 	unsigned long long latency_samples;
 	unsigned long long queue_wait_ns;
 	unsigned long long post_copy_wait_ns;
@@ -180,6 +185,8 @@ struct nvmev_io_worker_profile {
 	unsigned long long irq_sent;
 	unsigned long long irq_lock_fail;
 	unsigned long long irq_ns;
+	unsigned long long max_inflight;
+	unsigned int last_queue_full_sqid;
 };
 
 struct nvmev_config {
@@ -193,6 +200,7 @@ struct nvmev_config {
 	unsigned int cpu_nr_dispatchers[NR_MAX_DISPATCHERS];
 	unsigned int nr_io_workers;
 	unsigned int cpu_nr_io_workers[32];
+	unsigned int nr_max_parallel_io;
 
 	/* TODO Refactoring storage configurations */
 	unsigned int nr_io_units;
@@ -240,6 +248,7 @@ struct nvmev_io_worker {
 
 	unsigned int free_seq; /* free io req head index */
 	unsigned int free_seq_end; /* free io req tail index */
+	unsigned int nr_free_entries;
 	unsigned int io_seq; /* io req head index */
 	unsigned int io_seq_end; /* io req tail index */
 	spinlock_t pending_cq_lock;
@@ -252,6 +261,7 @@ struct nvmev_io_worker {
 	struct nvmev_io_worker_profile profile;
 
 	unsigned long long latest_nsecs;
+	unsigned long long last_reclaim_nsecs;
 
 	unsigned int id;
 	unsigned int dispatcher_id;
@@ -268,7 +278,6 @@ struct nvmev_dispatcher_ctx {
 	unsigned int first_worker_id;
 	unsigned int nr_workers;
 	unsigned int io_worker_turn;
-	unsigned int reclaim_batch_count;
 	unsigned int sq_qids[NR_MAX_IO_QUEUE];
 	unsigned int nr_sq_qids;
 	unsigned int cq_qids[NR_MAX_IO_QUEUE];

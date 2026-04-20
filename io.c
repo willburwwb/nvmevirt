@@ -18,16 +18,21 @@ struct buffer;
 #undef PERF_DEBUG
 
 /*
- * Reclaiming completed requests is dispatcher-side bookkeeping. Batching it
- * reduces front-end overhead under high IOPS while keeping queue-full recovery
- * on the slow path.
+ * Reclaiming completed requests is dispatcher-side bookkeeping. Trigger it
+ * only when the target worker is running low on allocatable queue entries so
+ * the dispatcher avoids paying reclaim cost on the common path.
  */
-#define NVMEV_RECLAIM_BATCH_SIZE 16
+#define NVMEV_RECLAIM_LOW_WATERMARK_PCT 5
 
 #define sq_entry(entry_id) sq->sq[SQ_ENTRY_TO_PAGE_NUM(entry_id)][SQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
 #define cq_entry(entry_id) cq->cq[CQ_ENTRY_TO_PAGE_NUM(entry_id)][CQ_ENTRY_TO_PAGE_OFFSET(entry_id)]
 
 extern bool io_using_dma;
+
+static inline unsigned int __nvmev_max_parallel_io(void)
+{
+	return nvmev_vdev->config.nr_max_parallel_io;
+}
 
 static inline unsigned int __get_io_worker(struct nvmev_dispatcher_ctx *disp, int sqid)
 {
@@ -40,9 +45,19 @@ static inline unsigned int __get_io_worker(struct nvmev_dispatcher_ctx *disp, in
 
 static inline bool __worker_queue_full(struct nvmev_io_worker *worker)
 {
-	struct nvmev_io_work *w = worker->work_queue + worker->free_seq;
+	return worker->nr_free_entries == 0;
+}
 
-	return w->next >= NR_MAX_PARALLEL_IO;
+static inline unsigned int __worker_reclaim_low_watermark(void)
+{
+	return max_t(unsigned int, 1,
+		     DIV_ROUND_UP(__nvmev_max_parallel_io() * NVMEV_RECLAIM_LOW_WATERMARK_PCT,
+				  100));
+}
+
+static inline bool __worker_needs_reclaim(struct nvmev_io_worker *worker)
+{
+	return worker->nr_free_entries <= __worker_reclaim_low_watermark();
 }
 
 static inline unsigned long long __get_wallclock(unsigned int cpu_nr)
@@ -308,20 +323,115 @@ static void __insert_req_sorted(unsigned int entry, struct nvmev_io_worker *work
 	}
 }
 
+static unsigned int __reclaim_completed_reqs_worker(struct nvmev_dispatcher_ctx *disp,
+						    struct nvmev_io_worker *worker)
+{
+	struct nvmev_io_work *w;
+	unsigned int nr_parallel_io = __nvmev_max_parallel_io();
+	unsigned int first_entry = -1;
+	unsigned int last_entry = -1;
+	unsigned int curr;
+	unsigned int nr_reclaimed = 0;
+	unsigned long long reclaim_start = 0;
+
+	if (unlikely(debug))
+		reclaim_start = local_clock();
+
+	first_entry = worker->io_seq;
+	curr = first_entry;
+
+	while (curr != -1) {
+		w = &worker->work_queue[curr];
+		if (w->is_completed == true && w->is_copied == true &&
+		    w->nsecs_target <= worker->latest_nsecs) {
+			last_entry = curr;
+			curr = w->next;
+			nr_reclaimed++;
+		} else {
+			break;
+		}
+	}
+
+	if (last_entry != -1) {
+		w = &worker->work_queue[last_entry];
+		worker->io_seq = w->next;
+		if (w->next != NVMEV_IO_WORK_INVALID)
+			worker->work_queue[w->next].prev = NVMEV_IO_WORK_INVALID;
+		w->next = NVMEV_IO_WORK_INVALID;
+
+		w = &worker->work_queue[first_entry];
+		if (worker->free_seq == NVMEV_IO_WORK_INVALID) {
+			w->prev = NVMEV_IO_WORK_INVALID;
+			worker->free_seq = first_entry;
+		} else {
+			w->prev = worker->free_seq_end;
+			w = &worker->work_queue[worker->free_seq_end];
+			w->next = first_entry;
+		}
+
+		worker->free_seq_end = last_entry;
+		worker->nr_free_entries += nr_reclaimed;
+		BUG_ON(worker->nr_free_entries > nr_parallel_io);
+		NVMEV_DEBUG_VERBOSE("%s: worker %u reclaimed %u entries (%u -- %u)\n",
+				    __func__, worker->id, nr_reclaimed, first_entry, last_entry);
+	}
+
+	if (unlikely(debug)) {
+		disp->profile.reclaim_calls++;
+		disp->profile.reclaim_ns += local_clock() - reclaim_start;
+		disp->profile.reclaimed_entries += nr_reclaimed;
+		worker->profile.reclaim_calls++;
+		worker->profile.reclaimed_entries += nr_reclaimed;
+	}
+
+	return nr_reclaimed;
+}
+
+static void __release_work_queue_entry(struct nvmev_io_worker *worker, unsigned int entry)
+{
+	struct nvmev_io_work *w = worker->work_queue + entry;
+
+	w->prev = NVMEV_IO_WORK_INVALID;
+	w->next = worker->free_seq;
+	if (worker->free_seq == NVMEV_IO_WORK_INVALID) {
+		worker->free_seq_end = entry;
+	} else {
+		worker->work_queue[worker->free_seq].prev = entry;
+	}
+	worker->free_seq = entry;
+	worker->nr_free_entries++;
+	BUG_ON(worker->nr_free_entries > __nvmev_max_parallel_io());
+}
+
 static struct nvmev_io_worker *__allocate_work_queue_entry(
 		struct nvmev_dispatcher_ctx *disp, int sqid, unsigned int *entry)
 {
 	unsigned int io_worker_turn = __get_io_worker(disp, sqid);
 	struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[io_worker_turn];
-	unsigned int e = worker->free_seq;
-	struct nvmev_io_work *w = worker->work_queue + e;
+	unsigned int e;
+	struct nvmev_io_work *w;
+
+	if (unlikely(__worker_needs_reclaim(worker) &&
+		     worker->latest_nsecs != worker->last_reclaim_nsecs)) {
+		if (unlikely(debug))
+			disp->profile.alloc_reclaim_calls++;
+		worker->profile.low_watermark_hits++;
+		worker->last_reclaim_nsecs = worker->latest_nsecs;
+		__reclaim_completed_reqs_worker(disp, worker);
+	}
 
 	if (__worker_queue_full(worker)) {
+		unsigned int inflight = __nvmev_max_parallel_io() - worker->nr_free_entries;
+
 		if (unlikely(debug))
 			disp->profile.alloc_reclaim_failures++;
+		worker->profile.queue_full_events++;
+		worker->profile.last_queue_full_sqid = sqid;
 		printk_ratelimited(KERN_WARNING
-				   "%s: worker %u work queue is full for sqid %d, throttling dispatcher\n",
-				   NVMEV_DRV_NAME, worker->id, sqid);
+				   "%s: worker %u work queue is full for sqid %d, throttling dispatcher (free=%u inflight=%u depth=%u low_wm=%u)\n",
+				   NVMEV_DRV_NAME, worker->id, sqid, worker->nr_free_entries,
+				   inflight, __nvmev_max_parallel_io(),
+				   __worker_reclaim_low_watermark());
 		return NULL;
 	}
 
@@ -330,25 +440,31 @@ static struct nvmev_io_worker *__allocate_work_queue_entry(
 		disp->io_worker_turn = 0;
 #endif
 
+	e = worker->free_seq;
+	BUG_ON(e == NVMEV_IO_WORK_INVALID);
+	w = worker->work_queue + e;
 	worker->free_seq = w->next;
-	BUG_ON(worker->free_seq >= NR_MAX_PARALLEL_IO);
+	if (worker->free_seq == NVMEV_IO_WORK_INVALID)
+		worker->free_seq_end = NVMEV_IO_WORK_INVALID;
+	else
+		worker->work_queue[worker->free_seq].prev = NVMEV_IO_WORK_INVALID;
+	worker->nr_free_entries--;
+	worker->profile.max_inflight = max_t(unsigned long long,
+					      worker->profile.max_inflight,
+					      __nvmev_max_parallel_io() - worker->nr_free_entries);
+	w->prev = NVMEV_IO_WORK_INVALID;
+	w->next = NVMEV_IO_WORK_INVALID;
 	*entry = e;
 
 	return worker;
 }
 
-static bool __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, int sqid, int cqid,
-			     int sq_entry, unsigned long long nsecs_start,
-			     struct nvmev_result *ret)
+static void __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, struct nvmev_io_worker *worker,
+			     unsigned int entry, int sqid, int cqid, int sq_entry,
+			     unsigned long long nsecs_start, struct nvmev_result *ret)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
-	struct nvmev_io_worker *worker;
 	struct nvmev_io_work *w;
-	unsigned int entry;
-
-	worker = __allocate_work_queue_entry(disp, sqid, &entry);
-	if (!worker)
-		return false;
 
 	w = worker->work_queue + entry;
 
@@ -376,8 +492,6 @@ static bool __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, int sqid, int cq
 	if (unlikely(debug))
 		disp->profile.sorted_enqueues++;
 	__insert_req_sorted(entry, worker, ret->nsecs_target);
-
-	return true;
 }
 
 void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
@@ -413,71 +527,6 @@ void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 	mb(); /* IO worker shall see the updated w at once */
 
 	__insert_req_sorted(entry, worker, nsecs_target);
-}
-
-static void __reclaim_completed_reqs(struct nvmev_dispatcher_ctx *disp)
-{
-	unsigned int turn;
-	unsigned int first_wid = disp->first_worker_id;
-	unsigned int last_wid = first_wid + disp->nr_workers;
-	unsigned int total_reclaimed = 0;
-	unsigned long long reclaim_start = 0;
-
-	if (unlikely(debug))
-		reclaim_start = local_clock();
-
-	for (turn = first_wid; turn < last_wid; turn++) {
-		struct nvmev_io_worker *worker;
-		struct nvmev_io_work *w;
-
-		unsigned int first_entry = -1;
-		unsigned int last_entry = -1;
-		unsigned int curr;
-		int nr_reclaimed = 0;
-
-		worker = &nvmev_vdev->io_workers[turn];
-
-		first_entry = worker->io_seq;
-		curr = first_entry;
-
-		while (curr != -1) {
-			w = &worker->work_queue[curr];
-			if (w->is_completed == true && w->is_copied == true &&
-			    w->nsecs_target <= worker->latest_nsecs) {
-				last_entry = curr;
-				curr = w->next;
-				nr_reclaimed++;
-			} else {
-				break;
-			}
-		}
-
-			if (last_entry != -1) {
-				w = &worker->work_queue[last_entry];
-				worker->io_seq = w->next;
-				if (w->next != -1) {
-					worker->work_queue[w->next].prev = -1;
-				}
-				w->next = -1;
-
-				w = &worker->work_queue[first_entry];
-				w->prev = worker->free_seq_end;
-
-				w = &worker->work_queue[worker->free_seq_end];
-				w->next = first_entry;
-
-				worker->free_seq_end = last_entry;
-				total_reclaimed += nr_reclaimed;
-				NVMEV_DEBUG_VERBOSE("%s: %u -- %u, %d\n", __func__,
-						    first_entry, last_entry, nr_reclaimed);
-			}
-		}
-
-	if (unlikely(debug)) {
-		disp->profile.reclaim_calls++;
-		disp->profile.reclaim_ns += local_clock() - reclaim_start;
-		disp->profile.reclaimed_entries += total_reclaimed;
-	}
 }
 
 static void __enqueue_pending_cq(struct nvmev_io_worker *worker, unsigned int cqid)
@@ -537,9 +586,11 @@ static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int s
 			      size_t *io_size)
 {
 	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
+	struct nvmev_io_worker *worker;
 	unsigned long long nsecs_start = __get_wallclock(disp->cpu_nr);
 	unsigned long long prof_start = 0;
 	struct nvme_command *cmd = &sq_entry(sq_entry);
+	unsigned int entry;
 #if (BASE_SSD == KV_PROTOTYPE)
 	uint32_t nsid = 0;
 #else
@@ -570,9 +621,19 @@ static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int s
 
 	if (unlikely(debug))
 		prof_start = local_clock();
-
-	if (!ns->proc_io_cmd(ns, &req, &ret))
+	worker = __allocate_work_queue_entry(disp, sqid, &entry);
+	if (!worker)
 		return false;
+	if (unlikely(debug))
+		disp->profile.enqueue_ns += local_clock() - prof_start;
+
+	if (unlikely(debug))
+		prof_start = local_clock();
+
+	if (!ns->proc_io_cmd(ns, &req, &ret)) {
+		__release_work_queue_entry(worker, entry);
+		return false;
+	}
 	if (unlikely(debug))
 		disp->profile.proc_io_ns += local_clock() - prof_start;
 	*io_size = __cmd_io_size(&sq_entry(sq_entry).rw);
@@ -583,28 +644,13 @@ static size_t __nvmev_proc_io(struct nvmev_dispatcher_ctx *disp, int sqid, int s
 
 	if (unlikely(debug))
 		prof_start = local_clock();
-	if (!__enqueue_io_req(disp, sqid, sq->cqid, sq_entry, nsecs_start, &ret)) {
-		if (unlikely(debug))
-			disp->profile.alloc_reclaim_calls++;
-		__reclaim_completed_reqs(disp);
-		disp->reclaim_batch_count = 0;
-		return false;
-	}
+	__enqueue_io_req(disp, worker, entry, sqid, sq->cqid, sq_entry, nsecs_start, &ret);
 	if (unlikely(debug))
 		disp->profile.enqueue_ns += local_clock() - prof_start;
 
 #ifdef PERF_DEBUG
 	prev_clock3 = local_clock();
 #endif
-
-	/*
-	 * Batch reclaim work so the dispatcher doesn't pay reclaim cost on every
-	 * single I/O. The failure path above still forces reclaim immediately.
-	 */
-	if (++disp->reclaim_batch_count >= NVMEV_RECLAIM_BATCH_SIZE) {
-		__reclaim_completed_reqs(disp);
-		disp->reclaim_batch_count = 0;
-	}
 
 #ifdef PERF_DEBUG
 	prev_clock4 = local_clock();
@@ -931,6 +977,7 @@ bool NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 {
 	unsigned int i, worker_id, disp_id;
 	unsigned int nr_disp = nvmev_vdev->nr_dispatchers;
+	unsigned int nr_parallel_io = nvmev_vdev->config.nr_max_parallel_io;
 	unsigned int nr_workers = nvmev_vdev->config.nr_io_workers;
 	unsigned int workers_per_disp = nr_workers / nr_disp;
 	unsigned int extra_workers = nr_workers % nr_disp;
@@ -955,28 +1002,31 @@ bool NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 	for (worker_id = 0; worker_id < nr_workers; worker_id++) {
 		struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[worker_id];
 
-		worker->work_queue = kvcalloc(NR_MAX_PARALLEL_IO,
+		worker->work_queue = kvcalloc(nr_parallel_io,
 					      sizeof(struct nvmev_io_work),
 					      GFP_KERNEL);
 		if (!worker->work_queue) {
 			NVMEV_ERROR("Failed to allocate work_queue for worker %u (%zu bytes)\n",
 				    worker_id,
-				    sizeof(struct nvmev_io_work) * (size_t)NR_MAX_PARALLEL_IO);
+				    sizeof(struct nvmev_io_work) * (size_t)nr_parallel_io);
 			goto err_alloc;
 		}
-		for (i = 0; i < NR_MAX_PARALLEL_IO; i++) {
-			worker->work_queue[i].next = i + 1;
-			worker->work_queue[i].prev = i - 1;
+		for (i = 0; i < nr_parallel_io; i++) {
+			worker->work_queue[i].next =
+				(i + 1 < nr_parallel_io) ? (i + 1) : NVMEV_IO_WORK_INVALID;
+			worker->work_queue[i].prev =
+				(i > 0) ? (i - 1) : NVMEV_IO_WORK_INVALID;
 		}
-		worker->work_queue[NR_MAX_PARALLEL_IO - 1].next = -1;
 		worker->id = worker_id;
 		worker->free_seq = 0;
-		worker->free_seq_end = NR_MAX_PARALLEL_IO - 1;
-		worker->io_seq = -1;
-		worker->io_seq_end = -1;
+		worker->free_seq_end = nr_parallel_io - 1;
+		worker->nr_free_entries = nr_parallel_io;
+		worker->io_seq = NVMEV_IO_WORK_INVALID;
+		worker->io_seq_end = NVMEV_IO_WORK_INVALID;
+		worker->last_reclaim_nsecs = 0;
 		spin_lock_init(&worker->pending_cq_lock);
-		worker->pending_cq_head = -1;
-		worker->pending_cq_tail = -1;
+		worker->pending_cq_head = NVMEV_IO_WORK_INVALID;
+		worker->pending_cq_tail = NVMEV_IO_WORK_INVALID;
 		memset(worker->pending_cq_next, 0xff, sizeof(worker->pending_cq_next));
 		worker->nr_cq_qids = 0;
 

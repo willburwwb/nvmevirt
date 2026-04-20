@@ -71,6 +71,7 @@ static unsigned int nr_io_units = 8;
 static unsigned int io_unit_shift = 12;
 
 static unsigned int nr_dispatchers = 1;
+static unsigned int nr_max_parallel_io = NVMEV_NR_MAX_PARALLEL_IO_DEFAULT;
 
 static char *cpus;
 unsigned int debug = 0;
@@ -111,6 +112,8 @@ module_param(io_unit_shift, uint, 0444);
 MODULE_PARM_DESC(io_unit_shift, "Size of each I/O unit (2^)");
 module_param(nr_dispatchers, uint, 0444);
 MODULE_PARM_DESC(nr_dispatchers, "Number of dispatcher threads (default 1)");
+module_param(nr_max_parallel_io, uint, 0444);
+MODULE_PARM_DESC(nr_max_parallel_io, "Per-worker work queue depth");
 module_param(cpus, charp, 0444);
 MODULE_PARM_DESC(cpus, "CPU list: first nr_dispatchers CPUs for dispatchers, rest for IO workers");
 module_param(debug, uint, 0644);
@@ -236,7 +239,6 @@ static void NVMEV_DISPATCHER_INIT(struct nvmev_dev *nvmev_vdev)
 		disp->first_worker_id = worker_offset;
 		disp->nr_workers = workers_per_disp + (i < extra_workers ? 1 : 0);
 		disp->io_worker_turn = 0;
-		disp->reclaim_batch_count = 0;
 		disp->nr_sq_qids = 0;
 		disp->nr_cq_qids = 0;
 
@@ -333,6 +335,10 @@ static int __validate_configs(void)
 		NVMEV_ERROR("Need non-zero write time\n");
 		return -EINVAL;
 	}
+	if (nr_max_parallel_io == 0) {
+		NVMEV_ERROR("Need non-zero per-worker work queue depth\n");
+		return -EINVAL;
+	}
 
 	return 0;
 }
@@ -367,6 +373,20 @@ static int __get_nr_entries(int dbs_idx, int queue_size)
 		diff += queue_size;
 	}
 	return diff;
+}
+
+static unsigned int __worker_reclaim_low_watermark_debug(const struct nvmev_config *cfg)
+{
+	return max_t(unsigned int, 1,
+		     DIV_ROUND_UP(cfg->nr_max_parallel_io * 5U, 100U));
+}
+
+static unsigned int __sq_worker_id_debug(unsigned int sqid)
+{
+	unsigned int disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, sqid);
+	struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[disp_id];
+
+	return nvmev_io_worker_id_for_queue(disp, sqid);
 }
 
 static void __reset_debug_stats(void)
@@ -458,13 +478,17 @@ static int __proc_file_read(struct seq_file *m, void *data)
 			}
 		}
 
-		seq_puts(m, "worker id loops scanned avg_scanned copy_calls avg_copy_ns "
+		seq_puts(m, "worker id disp cpu free inflight depth low_wm max_inflight "
+			    "cq_count low_wm_hits full_events last_full_sqid reclaim_calls "
+			    "reclaimed loops scanned avg_scanned copy_calls avg_copy_ns "
 			    "complete_calls avg_complete_ns irq_checks irq_sent avg_irq_ns "
 			    "irq_lock_fail\n");
 		if (nvmev_vdev->io_workers != NULL) {
 			for (i = 0; i < nvmev_vdev->config.nr_io_workers; i++) {
 				struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[i];
 				struct nvmev_io_worker_profile *p = &worker->profile;
+				unsigned int nr_free_entries = READ_ONCE(worker->nr_free_entries);
+				unsigned int inflight = cfg->nr_max_parallel_io - nr_free_entries;
 				unsigned long long avg_scanned =
 					p->loops ? div64_u64(p->scanned_entries, p->loops) : 0;
 				unsigned long long avg_copy =
@@ -476,11 +500,17 @@ static int __proc_file_read(struct seq_file *m, void *data)
 					p->irq_sent ? div64_u64(p->irq_ns, p->irq_sent) : 0;
 
 				seq_printf(m,
-					   "worker %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu\n",
-					   i, p->loops, p->scanned_entries, avg_scanned,
-					   p->copy_calls, avg_copy, p->complete_calls,
-					   avg_complete, p->irq_checks, p->irq_sent,
-					   avg_irq, p->irq_lock_fail);
+					   "worker %u %u %u %u %u %u %u %llu %u %llu %llu %u %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+					   i, worker->dispatcher_id, nvmev_vdev->config.cpu_nr_io_workers[i],
+					   nr_free_entries, inflight, cfg->nr_max_parallel_io,
+					   __worker_reclaim_low_watermark_debug(cfg), p->max_inflight,
+					   READ_ONCE(worker->nr_cq_qids), p->low_watermark_hits,
+					   p->queue_full_events, p->last_queue_full_sqid,
+					   p->reclaim_calls, p->reclaimed_entries, p->loops,
+					   p->scanned_entries, avg_scanned, p->copy_calls, avg_copy,
+					   p->complete_calls, avg_complete, p->irq_checks);
+				seq_printf(m, " %llu %llu %llu\n",
+					   p->irq_sent, avg_irq, p->irq_lock_fail);
 			}
 		}
 
@@ -505,6 +535,37 @@ static int __proc_file_read(struct seq_file *m, void *data)
 					   i, avg_queue_wait, avg_post_copy_wait,
 					   avg_total_device, p->latency_samples);
 			}
+		}
+
+		seq_puts(m, "sq_map sqid cqid dispatcher worker host_pending sq_inflight "
+			    "sq_size sq_dispatch sq_dispatched\n");
+		for (i = 1; i <= nvmev_vdev->nr_sq; i++) {
+			struct nvmev_submission_queue *sq = nvmev_vdev->sqes[i];
+			unsigned int disp_id;
+			unsigned int worker_id;
+
+			if (!sq)
+				continue;
+
+			disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, sq->qid);
+			worker_id = __sq_worker_id_debug(sq->qid);
+			seq_printf(m, "sq_map %u %u %u %u %u %u %u %u %u\n",
+				   sq->qid, sq->cqid, disp_id, worker_id,
+				   __get_nr_entries(sq->qid * 2, sq->queue_size),
+				   sq->stat.nr_in_flight, sq->queue_size,
+				   sq->stat.nr_dispatch, sq->stat.nr_dispatched);
+		}
+
+		seq_puts(m, "cq_map cqid dispatcher worker irq_enabled cq_size cq_head cq_tail\n");
+		for (i = 1; i <= nvmev_vdev->nr_cq; i++) {
+			struct nvmev_completion_queue *cq = nvmev_vdev->cqes[i];
+
+			if (!cq)
+				continue;
+
+			seq_printf(m, "cq_map %u %u %u %u %u %d %d\n",
+				   cq->qid, cq->dispatcher_id, cq->worker_id,
+				   cq->irq_enabled, cq->queue_size, cq->cq_head, cq->cq_tail);
 		}
 	}
 
@@ -672,6 +733,7 @@ static bool __load_configs(struct nvmev_config *config)
 	config->write_trailing = write_trailing;
 	config->nr_io_units = nr_io_units;
 	config->io_unit_shift = io_unit_shift;
+	config->nr_max_parallel_io = nr_max_parallel_io;
 
 	config->nr_dispatchers = nr_dispatchers;
 	config->nr_io_workers = 0;
@@ -694,8 +756,8 @@ static bool __load_configs(struct nvmev_config *config)
 		return false;
 	}
 
-	NVMEV_INFO("Configured %u dispatcher(s), %u IO worker(s)\n",
-		   config->nr_dispatchers, config->nr_io_workers);
+	NVMEV_INFO("Configured %u dispatcher(s), %u IO worker(s), work queue depth %u\n",
+		   config->nr_dispatchers, config->nr_io_workers, config->nr_max_parallel_io);
 
 	return true;
 }
