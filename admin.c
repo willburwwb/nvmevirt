@@ -84,60 +84,101 @@ static void __active_qid_del(unsigned int *qids, unsigned int *nr_qids, unsigned
 		WRITE_ONCE(qids[nr - 1], 0);
 		smp_wmb();
 		WRITE_ONCE(*nr_qids, nr - 1);
-		return;
+			return;
 	}
 }
 
-static void __nvmev_register_sq(unsigned int qid)
+static unsigned long long __dispatcher_queue_score(const struct nvmev_dispatcher_ctx *disp)
 {
-	struct nvmev_dispatcher_ctx *disp;
-	unsigned int disp_id;
-
-	disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, qid);
-	disp = &nvmev_vdev->dispatchers[disp_id];
-	__active_qid_add(disp->sq_qids, &disp->nr_sq_qids, qid);
+	return (unsigned long long)READ_ONCE(disp->nr_sq_qids) * 2ULL +
+	       (unsigned long long)READ_ONCE(disp->nr_cq_qids);
 }
 
-static void __nvmev_unregister_sq(unsigned int qid)
+static unsigned long long __worker_queue_score(const struct nvmev_io_worker *worker)
 {
-	struct nvmev_dispatcher_ctx *disp;
-	unsigned int disp_id;
-
-	disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, qid);
-	disp = &nvmev_vdev->dispatchers[disp_id];
-	__active_qid_del(disp->sq_qids, &disp->nr_sq_qids, qid);
+	return (unsigned long long)READ_ONCE(worker->nr_sq_qids) * 2ULL +
+	       (unsigned long long)READ_ONCE(worker->nr_cq_qids);
 }
 
-static void __nvmev_register_cq(unsigned int qid)
+static unsigned int __select_dispatcher_least_loaded(void)
 {
-	struct nvmev_dispatcher_ctx *disp;
-	struct nvmev_io_worker *worker;
 	unsigned int disp_id;
+	unsigned int best_id = 0;
+	unsigned long long best_score = (unsigned long long)-1;
+
+	for (disp_id = 0; disp_id < nvmev_vdev->nr_dispatchers; disp_id++) {
+		struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[disp_id];
+		unsigned long long score = __dispatcher_queue_score(disp);
+
+		if (score < best_score) {
+			best_score = score;
+			best_id = disp_id;
+		}
+	}
+
+	return best_id;
+}
+
+static unsigned int __select_worker_least_loaded(struct nvmev_dispatcher_ctx *disp)
+{
 	unsigned int worker_id;
+	unsigned int best_id = disp->first_worker_id;
+	unsigned long long best_score = (unsigned long long)-1;
 
-	disp_id = nvmev_dispatcher_id_for_cq(nvmev_vdev->nr_dispatchers, qid);
-	disp = &nvmev_vdev->dispatchers[disp_id];
-	worker_id = nvmev_io_worker_id_for_queue(disp, qid);
-	worker = &nvmev_vdev->io_workers[worker_id];
+	if (unlikely(disp->nr_workers == 0))
+		return disp->first_worker_id;
 
-	__active_qid_add(disp->cq_qids, &disp->nr_cq_qids, qid);
-	__active_qid_add(worker->cq_qids, &worker->nr_cq_qids, qid);
+	for (worker_id = disp->first_worker_id;
+	     worker_id < disp->first_worker_id + disp->nr_workers;
+	     worker_id++) {
+		struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[worker_id];
+		unsigned long long score = __worker_queue_score(worker);
+
+		if (score < best_score) {
+			best_score = score;
+			best_id = worker_id;
+		}
+	}
+
+	return best_id;
 }
 
-static void __nvmev_unregister_cq(unsigned int qid)
+static void __nvmev_register_sq(struct nvmev_submission_queue *sq)
 {
-	struct nvmev_dispatcher_ctx *disp;
-	struct nvmev_io_worker *worker;
-	unsigned int disp_id;
-	unsigned int worker_id;
+	struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[sq->dispatcher_id];
+	struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[sq->worker_id];
 
-	disp_id = nvmev_dispatcher_id_for_cq(nvmev_vdev->nr_dispatchers, qid);
-	disp = &nvmev_vdev->dispatchers[disp_id];
-	worker_id = nvmev_io_worker_id_for_queue(disp, qid);
-	worker = &nvmev_vdev->io_workers[worker_id];
+	__active_qid_add(disp->sq_qids, &disp->nr_sq_qids, sq->qid);
+	WRITE_ONCE(worker->nr_sq_qids, READ_ONCE(worker->nr_sq_qids) + 1);
+}
 
-	__active_qid_del(disp->cq_qids, &disp->nr_cq_qids, qid);
-	__active_qid_del(worker->cq_qids, &worker->nr_cq_qids, qid);
+static void __nvmev_unregister_sq(struct nvmev_submission_queue *sq)
+{
+	struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[sq->dispatcher_id];
+	struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[sq->worker_id];
+	unsigned int nr_sq_qids = READ_ONCE(worker->nr_sq_qids);
+
+	__active_qid_del(disp->sq_qids, &disp->nr_sq_qids, sq->qid);
+	if (nr_sq_qids > 0)
+		WRITE_ONCE(worker->nr_sq_qids, nr_sq_qids - 1);
+}
+
+static void __nvmev_register_cq(struct nvmev_completion_queue *cq)
+{
+	struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[cq->dispatcher_id];
+	struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[cq->worker_id];
+
+	__active_qid_add(disp->cq_qids, &disp->nr_cq_qids, cq->qid);
+	__active_qid_add(worker->cq_qids, &worker->nr_cq_qids, cq->qid);
+}
+
+static void __nvmev_unregister_cq(struct nvmev_completion_queue *cq)
+{
+	struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[cq->dispatcher_id];
+	struct nvmev_io_worker *worker = &nvmev_vdev->io_workers[cq->worker_id];
+
+	__active_qid_del(disp->cq_qids, &disp->nr_cq_qids, cq->qid);
+	__active_qid_del(worker->cq_qids, &worker->nr_cq_qids, cq->qid);
 }
 
 static void __nvmev_admin_create_cq(int eid)
@@ -163,9 +204,9 @@ static void __nvmev_admin_create_cq(int eid)
 
 	cq->cq_head = 0;
 	cq->cq_tail = -1;
-	cq->dispatcher_id = nvmev_dispatcher_id_for_cq(nvmev_vdev->nr_dispatchers, cq->qid);
+	cq->dispatcher_id = __select_dispatcher_least_loaded();
 	cq->worker_id =
-		nvmev_io_worker_id_for_queue(&nvmev_vdev->dispatchers[cq->dispatcher_id], cq->qid);
+		__select_worker_least_loaded(&nvmev_vdev->dispatchers[cq->dispatcher_id]);
 
 	spin_lock_init(&cq->entry_lock);
 	mutex_init(&cq->irq_lock);
@@ -191,7 +232,7 @@ static void __nvmev_admin_create_cq(int eid)
 
 	dbs_idx = cq->qid * 2 + 1;
 	nvmev_vdev->dbs[dbs_idx] = nvmev_vdev->old_dbs[dbs_idx] = 0;
-	__nvmev_register_cq(cq->qid);
+	__nvmev_register_cq(cq);
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
@@ -205,8 +246,9 @@ static void __nvmev_admin_delete_cq(int eid)
 	qid = sq_entry(eid).delete_queue.qid;
 
 	cq = nvmev_vdev->cqes[qid];
+	if (cq)
+		__nvmev_unregister_cq(cq);
 	nvmev_vdev->cqes[qid] = NULL;
-	__nvmev_unregister_cq(qid);
 
 	if (cq) {
 		kfree(cq->cq);
@@ -230,6 +272,13 @@ static void __nvmev_admin_create_sq(int eid)
 
 	sq->qid = cmd->sqid;
 	sq->cqid = cmd->cqid;
+	if (nvmev_vdev->cqes[sq->cqid]) {
+		sq->dispatcher_id = nvmev_vdev->cqes[sq->cqid]->dispatcher_id;
+	} else {
+		sq->dispatcher_id = __select_dispatcher_least_loaded();
+	}
+	sq->worker_id =
+		__select_worker_least_loaded(&nvmev_vdev->dispatchers[sq->dispatcher_id]);
 
 	sq->priority = cmd->sq_flags & 0xFFFE;
 	sq->queue_size = cmd->qsize + 1;
@@ -256,7 +305,7 @@ static void __nvmev_admin_create_sq(int eid)
 	dbs_idx = sq->qid * 2;
 	nvmev_vdev->dbs[dbs_idx] = 0;
 	nvmev_vdev->old_dbs[dbs_idx] = 0;
-	__nvmev_register_sq(sq->qid);
+	__nvmev_register_sq(sq);
 
 	__make_cq_entry(eid, NVME_SC_SUCCESS);
 }
@@ -271,8 +320,9 @@ static void __nvmev_admin_delete_sq(int eid)
 	qid = cmd->qid;
 
 	sq = nvmev_vdev->sqes[qid];
+	if (sq)
+		__nvmev_unregister_sq(sq);
 	nvmev_vdev->sqes[qid] = NULL;
-	__nvmev_unregister_sq(qid);
 
 	if (sq) {
 		kfree(sq->sq);

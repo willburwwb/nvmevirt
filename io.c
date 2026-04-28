@@ -37,6 +37,10 @@ static inline unsigned int __nvmev_max_parallel_io(void)
 static inline unsigned int __get_io_worker(struct nvmev_dispatcher_ctx *disp, int sqid)
 {
 #ifdef CONFIG_NVMEV_IO_WORKER_BY_SQ
+	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
+
+	if (likely(sq))
+		return sq->worker_id;
 	return nvmev_io_worker_id_for_queue(disp, sqid);
 #endif
 #ifndef CONFIG_NVMEV_IO_WORKER_BY_SQ
@@ -487,7 +491,9 @@ static void __enqueue_io_req(struct nvmev_dispatcher_ctx *disp, struct nvmev_io_
 void schedule_internal_operation(int sqid, unsigned long long nsecs_target,
 				 struct buffer *write_buffer, size_t buffs_to_release)
 {
-	unsigned int disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, sqid);
+	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
+	unsigned int disp_id = sq ? sq->dispatcher_id :
+				 nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, sqid);
 	struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[disp_id];
 	struct nvmev_io_worker *worker;
 	struct nvmev_io_work *w;
@@ -1053,6 +1059,7 @@ bool NVMEV_IO_WORKER_INIT(struct nvmev_dev *nvmev_vdev)
 		worker->pending_cq_tail = NVMEV_IO_WORK_INVALID;
 		memset(worker->pending_cq_next, 0xff, sizeof(worker->pending_cq_next));
 		worker->nr_cq_qids = 0;
+		worker->nr_sq_qids = 0;
 
 		snprintf(worker->thread_name, sizeof(worker->thread_name),
 			 "nvmev_io_worker_%d", worker_id);

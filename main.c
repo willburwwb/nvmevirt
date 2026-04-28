@@ -378,10 +378,11 @@ static int __get_nr_entries(int dbs_idx, int queue_size)
 
 static unsigned int __sq_worker_id_debug(unsigned int sqid)
 {
-	unsigned int disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, sqid);
-	struct nvmev_dispatcher_ctx *disp = &nvmev_vdev->dispatchers[disp_id];
+	struct nvmev_submission_queue *sq = nvmev_vdev->sqes[sqid];
 
-	return nvmev_io_worker_id_for_queue(disp, sqid);
+	if (!sq)
+		return NVMEV_IO_WORK_INVALID;
+	return sq->worker_id;
 }
 
 static void __reset_debug_stats(void)
@@ -534,21 +535,18 @@ static int __proc_file_read(struct seq_file *m, void *data)
 
 		seq_puts(m, "sq_map sqid cqid dispatcher worker host_pending "
 			    "sq_inflight sq_size sq_dispatch sq_dispatched\n");
-		for (i = 1; i <= nvmev_vdev->nr_sq; i++) {
-			struct nvmev_submission_queue *sq = nvmev_vdev->sqes[i];
-			unsigned int disp_id;
-			unsigned int worker_id;
+			for (i = 1; i <= nvmev_vdev->nr_sq; i++) {
+				struct nvmev_submission_queue *sq = nvmev_vdev->sqes[i];
 
-			if (!sq)
-				continue;
+				if (!sq)
+					continue;
 
-			disp_id = nvmev_dispatcher_id_for_sq(nvmev_vdev->nr_dispatchers, sq->qid);
-			worker_id = __sq_worker_id_debug(sq->qid);
-			seq_printf(m, "sq_map %u %u %u %u %u %u %u %u %u\n",
-				   sq->qid, sq->cqid, disp_id, worker_id,
-				   __get_nr_entries(sq->qid * 2, sq->queue_size),
-				   sq->stat.nr_in_flight, sq->queue_size,
-				   sq->stat.nr_dispatch, sq->stat.nr_dispatched);
+				seq_printf(m, "sq_map %u %u %u %u %u %u %u %u %u\n",
+					   sq->qid, sq->cqid, sq->dispatcher_id,
+					   __sq_worker_id_debug(sq->qid),
+					   __get_nr_entries(sq->qid * 2, sq->queue_size),
+					   sq->stat.nr_in_flight, sq->queue_size,
+					   sq->stat.nr_dispatch, sq->stat.nr_dispatched);
 		}
 
 		seq_puts(m, "cq_map cqid dispatcher worker irq_enabled cq_size cq_head cq_tail\n");

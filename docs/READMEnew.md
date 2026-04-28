@@ -1,8 +1,5 @@
 # NVMevirt-multithread 使用说明
 
-本文档说明当前 NVMeVirt 多线程版本的整体设计、编译方式和运行方法。示例命令中的
-CPU、内存地址、设备节点和 PCI BDF 需要按实际机器调整。
-
 ## 整体设计
 
 ### NVMevirt 多线程支持
@@ -51,13 +48,6 @@ CPU、内存地址、设备节点和 PCI BDF 需要按实际机器调整。
   - dispatcher 内部的 worker 选择默认按 SQ/CQ 的 qid 映射到该 dispatcher 的 worker
     子集，使同一队列的请求和中断处理路径更加稳定。
 
-- **并发安全**
-  - 多 dispatcher 会并发进入 FTL 调度路径。
-  - NVM/simple FTL 中的 `io_unit_stat[]` 使用 `cmpxchg64` 和 `READ_ONCE` 原子推进
-    busy-until 时间，避免多个 dispatcher 同时更新时丢失状态。
-  - Admin Queue 创建/删除 I/O SQ/CQ 时，会把 qid 注册到对应 dispatcher 和 worker 的
-    活跃队列表中；dispatcher 循环只扫描自己的 qid 列表。
-
 ### Reclaim 优化
 
 io_worker 的 work queue 是固定大小队列，完成的请求需要回收到 free list 后才能继续
@@ -68,18 +58,9 @@ io_worker 的 work queue 是固定大小队列，完成的请求需要回收到 
   - 每分发一批请求后再回收，批大小由 `NVMEV_RECLAIM_BATCH_SIZE` 控制，当前为 `16`。
   - 这样避免每个请求都付出 reclaim 成本，同时能及时释放 worker 队列中的已完成 entry。
 
-- **队列满时快速 reclaim**
-  - 如果目标 worker 队列已满，dispatcher 会立即尝试 reclaim 自己名下 worker 的已完成
-    entry。
-  - 如果 reclaim 后仍无空闲 entry，则本轮分发停止，等待后续循环继续处理，避免无限制占用 CPU。
-
-- **CQ 中断路径优化**
-  - worker 在填 CQ 时只把需要触发中断的 CQ 放入 pending CQ 链表。
-  - worker 主循环优先处理 pending CQ，避免在 CQ 数量较多时反复扫描全部 CQ。
-
 - **调试观测**
   - 加载模块时设置 `debug=1` 后，可通过 `/proc/nvmev/debug` 查看 dispatcher/worker 的
-    reclaim 次数、平均耗时、队列满事件、SQ/CQ 映射等信息。
+    reclaim 次数、平均耗时等信息。
 
 ## 编译说明
 
@@ -100,32 +81,14 @@ io_worker 的 work queue 是固定大小队列，完成的请求需要回收到 
   sudo reboot
   ```
 
-- 建议通过 `isolcpus` 预留 NVMeVirt 使用的 CPU，避免 Linux 调度器把普通任务放到这些
+- 通过 `isolcpus` 预留 NVMeVirt 使用的 CPU，避免 Linux 调度器把普通任务放到这些
   CPU 上。例如 5 个 dispatcher + 10 个 io_worker：
 
   ```bash
   GRUB_CMDLINE_LINUX="memmap=32G\\\$64G isolcpus=7-21"
   ```
 
-- CPU 数量要求：
-  - 至少提供 `nr_dispatchers` 个 dispatcher CPU。
-  - 为了真正执行 I/O，还需要提供至少 1 个 io_worker CPU。
-  - 推荐按测试目标显式留出 `nr_dispatchers + nr_io_workers` 个空闲 CPU。
-
-### 2. 选择设备模型
-
-编译前在 `Kbuild` 中选择一个目标设备模型。默认配置为 NVM/Optane 模型：
-
-```makefile
-CONFIG_NVMEVIRT_NVM := y
-#CONFIG_NVMEVIRT_SSD := y
-#CONFIG_NVMEVIRT_ZNS := y
-#CONFIG_NVMEVIRT_KV := y
-```
-
-一次只启用一个模型。SSD/ZNS/KV 模型的参数可继续参考对应配置文件和原有文档。
-
-### 3. 编译内核模块
+### 2. 编译内核模块
 
 在仓库根目录执行：
 
@@ -172,7 +135,7 @@ CPU 分配如下：
 加载后检查内核日志：
 
 ```bash
-sudo dmesg | tail -n 80
+dmesg | tail -n 80
 ```
 
 应能看到类似信息：
@@ -185,34 +148,26 @@ NVMeVirt: nvmev_io_worker_0 started on cpu 12 ...
 NVMeVirt: Virtual NVMe device created
 ```
 
-确认块设备：
-
-```bash
-sudo nvme list
-ls -l /dev/nvme*n1
-```
-
-如果需要查看 dispatcher/worker 映射与统计，可开启 debug：
-
-```bash
-sudo rmmod nvmev 2>/dev/null || true
-sudo insmod ./nvmev.ko \
-  memmap_start=64G \
-  memmap_size=32G \
-  nr_dispatchers=5 \
-  cpus=7,8,9,10,11,12,13,14,15,16,17,18,19,20,21 \
-  debug=1
-
-cat /proc/nvmev/debug
-echo reset | sudo tee /proc/nvmev/debug
-```
-
 ### 2. 启动 SPDK
 
-如果用 SPDK 绕过内核块层测试 NVMeVirt，需要先找到 NVMeVirt 暴露出的 PCI BDF，再把该
-设备绑定给 SPDK 使用的 userspace driver。
+如果希望使用 **SPDK + fio** 绕过 Linux 内核块层测试 NVMeVirt，需要先编译 SPDK 的 fio
+插件，再把 NVMeVirt 暴露出的 PCI 设备绑定到 SPDK 使用的 userspace driver。
 
-1. 查找 NVMeVirt 设备 BDF：
+1. 编译 SPDK fio 插件：
+
+   ```bash
+   cd /path/to/spdk
+   ./configure --with-fio=/path/to/fio-3.28-src
+   make -j"$(nproc)"
+   ```
+
+   编译成功后应能看到：
+
+   ```text
+   /path/to/spdk/build/fio/spdk_bdev
+   ```
+
+2. 查找 NVMeVirt 设备 BDF：
 
    ```bash
    lspci -nn | grep -i -E '0c51|nvme'
@@ -220,122 +175,125 @@ echo reset | sudo tee /proc/nvmev/debug
 
    内核日志中也会打印类似 `nvme nvme0: pci function 0001:10:00.0` 的 BDF。
 
-2. 准备 hugepage 并绑定设备。以下命令以 `0001:10:00.0` 为例，实际请替换为本机 BDF：
+3. 准备 hugepage 并绑定设备。以下命令以 `0001:10:00.0` 为例，实际请替换为本机 BDF：
 
    ```bash
    cd /path/to/spdk
-   sudo HUGEMEM=4096 PCI_ALLOWED="0001:10:00.0" ./scripts/setup.sh
+   sudo PCI_ALLOWED="0001:10:00.0" HUGEMEM=1024 ./scripts/setup.sh
    ```
 
-3. 使用 SPDK `perf` 进行 4K 随机读测试：
+   可以先检查当前绑定状态：
 
    ```bash
-   sudo ./build/examples/perf \
-     -q 64 \
-     -o 4096 \
-     -w randread \
-     -t 60 \
-     -c 0x3c0000 \
-     -r 'trtype:PCIe traddr:0001:10:00.0'
+   cd /path/to/spdk
+   sudo PCI_ALLOWED="0001:10:00.0" ./scripts/setup.sh status
+   ```
+
+   成功后该设备通常会从内核 `nvme` 驱动切换到 `vfio-pci` 或 `uio_pci_generic`。
+
+5. 准备 SPDK bdev 配置文件，例如 `/tmp/nvmevirt_bdev.json`：
+
+   ```json
+   {
+     "subsystems": [
+       {
+         "subsystem": "bdev",
+         "config": [
+           {
+             "method": "bdev_nvme_attach_controller",
+             "params": {
+               "name": "Nvme0",
+               "trtype": "PCIe",
+               "traddr": "0001:10:00.0",
+               "io_queue_size": 8192
+             }
+           }
+         ]
+       }
+     ]
+   }
    ```
 
    其中：
 
-   - `-q 64`：每个 qpair 的队列深度；
-   - `-o 4096`：4 KiB I/O；
-   - `-w randread`：随机读；
-   - `-c`：SPDK reactor 使用的 CPU mask，建议不要与 NVMeVirt 的 dispatcher/worker CPU
-     重叠；
-   - `traddr`：NVMeVirt 设备的 PCI BDF。
+   - `traddr` 需要替换成当前 NVMeVirt 的 PCI BDF；
+   - `name` 这里使用 `Nvme0`，后续 fio 里会用到 `Nvme0n1`；
+   - `io_queue_size` 可以按测试需要调整。
 
-如果希望改回 Linux 内核驱动测试，需要先让 SPDK 解绑并重新绑定内核驱动，或重启后重新
-加载 NVMeVirt。
 
-### 3. Linux fio 基准测试
 
-内核块设备路径可直接使用 fio。以下假设设备为 `/dev/nvme3n1`，请按 `nvme list` 输出替换：
+### 3. fio 基准测试
 
-```bash
-sudo fio --name=nvmevirt-randread \
-  --filename=/dev/nvme3n1 \
-  --ioengine=io_uring \
-  --direct=1 \
-  --rw=randread \
-  --bs=4k \
-  --iodepth=64 \
-  --numjobs=16 \
-  --runtime=60 \
-  --time_based \
-  --group_reporting=1
-```
+注意：使用 **SPDK + fio** 时，`fio` 里不能再直接写 `/dev/nvmeXn1`。设备一旦被 SPDK
+接管，测试目标应写成 SPDK bdev 名，例如 `Nvme0n1`。
 
-正确性测试可使用 fio verify：
+1. 准备 fio job，例如 `/tmp/nvmevirt_randread.fio`：
 
-```bash
-sudo fio --name=verify1 \
-  --filename=/dev/nvme3n1 \
-  --ioengine=io_uring \
-  --direct=1 \
-  --bs=4k \
-  --iodepth=64 \
-  --numjobs=1 \
-  --rw=randwrite \
-  --size=1G \
-  --verify=crc32c \
-  --verify_fatal=1 \
-  --do_verify=1 \
-  --group_reporting=1
-```
+   ```ini
+   [global]
+   ioengine=/home/wwb/StorageXpress/spdk/build/fio/spdk_bdev
+   spdk_json_conf=/tmp/nvmevirt_bdev.json
+   thread=1
+   direct=1
+   group_reporting=1
+   time_based=1
+   runtime=30
+   ramp_time=5
+   norandommap=1
+   bs=4k
+   rw=randread
+   iodepth=64
+   numjobs=16
 
-多 job 做 verify 时要用 `offset_increment` 避免多个 job 写同一 LBA 区间导致误报。
+   [nvmevirt]
+   filename=Nvme0n1
+   ```
 
-### 4. 测试结果与观测方法
+   关键参数说明：
 
-建议固定 workload，对比以下配置：
+   - `thread=1` 是必须的，SPDK fio 插件不支持 fio 默认的进程模型；
+   - `ioengine` 需要指向 `spdk_bdev` 插件的实际路径；
+   - `spdk_json_conf` 指向上一步生成的 JSON 文件；
+   - `filename=Nvme0n1` 中的 `Nvme0` 来自 JSON 里的控制器名，`n1` 表示 namespace 1。
+
+2. 运行测试：
 
 ```bash
-# 单 dispatcher 基线
-sudo insmod ./nvmev.ko \
-  memmap_start=64G \
-  memmap_size=32G \
-  nr_dispatchers=1 \
-  cpus=7,8,9,10,11
-
-# 多 dispatcher
-sudo insmod ./nvmev.ko \
-  memmap_start=64G \
-  memmap_size=32G \
-  nr_dispatchers=5 \
-  cpus=7,8,9,10,11,12,13,14,15,16,17,18,19,20,21
+sudo fio /tmp/nvmevirt_randread.fio
 ```
 
-重点观察：
+### 4. 测试结果
 
-- fio/SPDK 输出中的 IOPS、平均时延、p99/p99.9 tail latency；
-- `/proc/nvmev/stat` 中每个 SQ 的 in-flight、dispatch、dispatched、total_io；
-- `/proc/nvmev/debug` 中：
-  - 每个 dispatcher 的 `sq_entries`、`avg_proc_io_ns`、`avg_enqueue_ns`；
-  - reclaim 调用次数和平均耗时；
-  - worker 队列满事件 `full_events`；
-  - `sq_map` / `cq_map` 是否均匀分布到多个 dispatcher 和 worker。
+```
+(base) ➜  spdk git:(master) ✗ sudo fio /home/wwb/StorageXpress/nvme6_randread.fio            
+nvme6: (g=0): rw=randread, bs=(R) 1024B-1024B, (W) 1024B-1024B, (T) 1024B-1024B, ioengine=spdk_bdev, iodepth=64
+...
+fio-3.28
+Starting 16 threads
+Jobs: 5 (f=5): [_(1),r(2),_(6),r(1),_(4),r(2)][29.8%][r=8158MiB/s][r=8354k IOPS][eta 01m:25s]
+nvme6: (groupid=0, jobs=16): err= 0: pid=124707: Tue Apr 28 10:06:52 2026
+  read: IOPS=8537k, BW=8337MiB/s (8742MB/s)(244GiB/30001msec)
+    slat (nsec): min=90, max=1761.1k, avg=159.09, stdev=891.25
+    clat (usec): min=15, max=1995, avg=119.21, stdev=58.68
+     lat (usec): min=16, max=1996, avg=119.37, stdev=58.67
+    clat percentiles (usec):
+     |  1.00th=[   37],  5.00th=[   38], 10.00th=[   39], 20.00th=[   81],
+     | 30.00th=[   87], 40.00th=[  104], 50.00th=[  128], 60.00th=[  137],
+     | 70.00th=[  145], 80.00th=[  151], 90.00th=[  217], 95.00th=[  221],
+     | 99.00th=[  227], 99.50th=[  229], 99.90th=[  231], 99.95th=[  233],
+     | 99.99th=[ 1778]
+   bw (  MiB/s): min= 8163, max= 8671, per=99.80%, avg=8320.57, stdev= 9.17, samples=945
+   iops        : min=8359243, max=8879177, avg=8520262.94, stdev=9390.62, samples=945
+  lat (usec)   : 20=0.01%, 50=19.11%, 100=20.20%, 250=60.67%, 500=0.01%
+  lat (msec)   : 2=0.01%
+  cpu          : usr=99.80%, sys=0.00%, ctx=777, majf=0, minf=0
+  IO depths    : 1=0.1%, 2=0.1%, 4=0.1%, 8=0.1%, 16=0.1%, 32=23.1%, >=64=76.9%
+     submit    : 0=0.0%, 4=100.0%, 8=0.0%, 16=0.0%, 32=0.0%, 64=0.0%, >=64=0.0%
+     complete  : 0=0.0%, 4=99.8%, 8=0.2%, 16=0.1%, 32=0.1%, 64=0.1%, >=64=0.0%
+     issued rwts: total=256129457,0,0,0 short=0,0,0,0 dropped=0,0,0,0
+     latency   : target=0, window=0, percentile=100.00%, depth=64
 
-已有实验结论表明：在高性能设备模型下，单 dispatcher 对活跃 SQ 的串行处理会限制整体
-IOPS；增加 io_worker 数量到一定程度后收益变小，而多 dispatcher 能把 SQ/CQ 分发路径
-并行化，是继续提升高 IOPS 场景上限的关键。
-
-## 常见问题
-
-| 现象 | 可能原因与处理 |
-| --- | --- |
-| `insmod` 报 reserved memory 相关错误 | `memmap_start/memmap_size` 与 grub 中 `memmap=` 不匹配，或该地址仍是可用 RAM |
-| 看不到 `/dev/nvmeXn1` | 检查 `dmesg`、`nvme list`，确认 namespace 是否枚举成功 |
-| dispatcher/worker 没有按预期 CPU 启动 | 检查 `nr_dispatchers` 和 `cpus` 顺序，前 N 个 CPU 才是 dispatcher |
-| 多 job fio verify 报 `bad header` | 多个 job 写入区域重叠，使用单 job 或设置 `offset_increment` |
-| SPDK 找不到设备 | 确认 BDF 正确、设备已绑定到 SPDK 使用的 driver，且 IOMMU/vfio 配置满足 SPDK 要求 |
-| 高 IOPS 下 worker 队列满 | 增大 `nr_max_parallel_io`，增加 worker，或通过 `/proc/nvmev/debug` 查看是否 reclaim 成本过高 |
-
-## 参考文档
-
-- [多 Dispatcher 设计与使用说明](./多Dispatcher设计与使用.md)
-- [NVMeVirt 正确性测试说明](./NVMeVirt正确性测试.md)
-- [实验结果](./实验结果.md)
+Run status group 0 (all jobs):
+   READ: bw=8337MiB/s (8742MB/s), 8337MiB/s-8337MiB/s (8742MB/s-8742MB/s), io=244GiB (262GB), run=30001-30001msec
+```
+可以看到此时 IOPS 达到 8.537M，带宽达到 8.337GB/s。

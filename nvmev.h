@@ -96,6 +96,8 @@ struct nvmev_sq_stat {
 struct nvmev_submission_queue {
 	int qid;
 	int cqid;
+	unsigned int dispatcher_id;
+	unsigned int worker_id;
 	int priority;
 	bool phys_contig;
 
@@ -259,6 +261,7 @@ struct nvmev_io_worker {
 	bool pending_cq_enqueued[NR_MAX_IO_QUEUE + 1];
 	unsigned int cq_qids[NR_MAX_IO_QUEUE];
 	unsigned int nr_cq_qids;
+	unsigned int nr_sq_qids;
 	struct nvmev_io_worker_profile profile;
 
 	unsigned long long latest_nsecs;
